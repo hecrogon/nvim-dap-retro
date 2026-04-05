@@ -1,0 +1,15 @@
+{
+  "configurations": [
+    {
+      "type": "zesarux",
+      "request": "launch",
+      "name": "ZEsarUX Debug",
+      "zesaruxPath": "zesarux",
+      "zesaruxArgs": ["--machine", "cpc6128", "--snap-no-change-machine", "--disable-autoframeskip"],
+      "program": "${workspaceFolder}/build/hello.bin",
+      "sldFile": "${workspaceFolder}/build/hello.sld",
+      "loadAddress": "0x4000",
+      "preLaunchTask": "build"
+    }
+  ]
+}

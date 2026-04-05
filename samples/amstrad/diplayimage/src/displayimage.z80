@@ -1,0 +1,66 @@
+    DEVICE AMSTRADCPC6128
+
+    org 0x4000
+
+wait_char equ 0xBB06
+
+main:
+    ld a, #1
+    call 0xBC0E
+
+    call set_palette
+
+    ; Draw 8 rows of 2 bytes each
+    ld hl, sprite_data
+
+    ld de, 0xC000
+    call draw_row
+    ld de, 0xC800
+    call draw_row
+    ld de, 0xD000
+    call draw_row
+    ld de, 0xD800
+    call draw_row
+    ld de, 0xE000
+    call draw_row
+    ld de, 0xE800
+    call draw_row
+    ld de, 0xF000
+    call draw_row
+    ld de, 0xF800
+    call draw_row
+
+loop:
+    jr loop
+
+set_palette:
+    ld a, (palette_image)
+    ld b, 5
+
+    ret
+    ; call #0xBC32
+    
+draw_row:
+    ld a, (hl)
+    ld (de), a
+    inc hl
+    inc de
+    ld a, (hl)
+    ld (de), a
+    inc hl
+
+    ret
+
+sprite_data:
+    defb 0xDF, 0x00
+    defb 0x99, 0x00
+    defb 0xFF, 0x00
+    defb 0x66, 0x00
+    defb 0x66, 0x00
+    defb 0xFF, 0x00
+    defb 0x99, 0x00
+    defb 0xFF, 0x00
+
+    include "image.z80"
+
+    SAVEBIN "build/displayimage.bin", 0x4000, 0x1000
