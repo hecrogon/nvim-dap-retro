@@ -1,39 +1,39 @@
     DEVICE AMSTRADCPC6128
 
-    org 0x4000
+    ORG 0x4000
 
-print_char equ 0xBB5A
-wait_char equ 0xBB06
+PRINT_CHAR EQU 0xBB5A
+WAIT_CHAR EQU 0xBB06
 
-main:
-    ld a, #0
-    call 0xBC0E
+MAIN:
+    LD A,#0
+    CALL 0xBC0E
 
-    ld a, 'H'
-    call print_char
-    ld a, 'E'
-    call print_char
-    ld a, 'L'
-    call print_char
-    ld a, 'L'
-    call print_char
-    ld a, 'O'
-    call print_char
+    LD A,'H'
+    CALL PRINT_CHAR
+    LD A,'E'
+    CALL PRINT_CHAR
+    LD A,'L'
+    CALL PRINT_CHAR
+    LD A,'L'
+    CALL PRINT_CHAR
+    LD A,'O'
+    CALL PRINT_CHAR
 
-    ld hl, 0xC370
-    ld c, 10d
-pixel_loop:
-    ld (hl), 255
-    inc hl
+    LD HL,0xC370
+    LD C,10d
+PIXEL_LOOP:
+    LD (HL),255
+    INC HL
 
-    dec c
-    jp nz, pixel_loop
+    DEC C
+    JP NZ,PIXEL_LOOP
 
-    ld hl, 0xCB70
-    ld (hl), 255
+    LD HL,0xCB70
+    LD (HL),255
 
-    call wait_char
+    CALL WAIT_CHAR
 
-    ret
+    RET
 
-    SAVEBIN "build/hello.bin", 0x4000, 0x1000
+    SAVEBIN "build/hello.bin",0x4000,0x1000
