@@ -159,28 +159,34 @@ class ZesaruxAdapter(DAPAdapter):
             'success': True,
         })
 
+    def _load_binary(self, source_path=None):
+        if self._setup_done:
+            return
+        if self.bin_file is None or self.sld_file is None:
+            if source_path is None:
+                logging.error('No source path available to resolve bin/sld files')
+                return
+            sp = Path(source_path)
+            project_root = sp.parent.parent
+            name = sp.stem
+            resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
+            resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
+        else:
+            resolved_bin = self.bin_file
+            resolved_sld = self.sld_file
+
+        logging.debug(f'ZRCP >>> load-binary {resolved_bin} {self._load_address:x}h 0')
+        self._sock.sendall(f'load-binary {resolved_bin} {self._load_address:x}h 0\n'.encode('ascii'))
+        self.zesarux_recv_until_prompt()
+        logging.debug('ZRCP >>> enable-breakpoints')
+        self._sock.sendall(b'enable-breakpoints\n')
+        self.zesarux_recv_until_prompt()
+        self.sld_map, self.address_to_line = self.parse_sld(resolved_sld)
+        self._setup_done = True
+
     def handle_set_breakpoints(self, msg):
         self._source_path = msg['arguments']['source']['path']
-
-        if not self._setup_done:
-            if self.bin_file is None or self.sld_file is None:
-                source_path = Path(self._source_path)
-                project_root = source_path.parent.parent
-                name = source_path.stem
-                resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
-                resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
-            else:
-                resolved_bin = self.bin_file
-                resolved_sld = self.sld_file
-
-            logging.debug(f'ZRCP >>> load-binary {resolved_bin} {self._load_address:x}h 0')
-            self._sock.sendall(f'load-binary {resolved_bin} {self._load_address:x}h 0\n'.encode('ascii'))
-            self.zesarux_recv_until_prompt()
-            logging.debug('ZRCP >>> enable-breakpoints')
-            self._sock.sendall(b'enable-breakpoints\n')
-            self.zesarux_recv_until_prompt()
-            self.sld_map, self.address_to_line = self.parse_sld(resolved_sld)
-            self._setup_done = True
+        self._load_binary(self._source_path)
 
         new_indices = set()
         breakpoints = []
@@ -211,6 +217,7 @@ class ZesaruxAdapter(DAPAdapter):
         })
 
     def handle_configuration_done(self, msg):
+        self._load_binary(getattr(self, '_source_path', None))
         self.zesarux_send(f'set-register PC={self._load_address:x}h')
         self.start_monitor('breakpoint')
         self.zesarux_run()
