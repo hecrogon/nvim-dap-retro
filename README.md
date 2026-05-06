@@ -14,7 +14,7 @@ A [nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin for debugging retr
 
 ## Installation
 
-Using [lazy.nvim](https://github.com/folke/lazy.nvim):
+Using [lazy.nvim](https://github.com/folke/lazy.nvim), create `~/.config/nvim/lua/plugins/nvim-dap-retro.lua`:
 
 ```lua
 {
@@ -25,12 +25,12 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
     "nvim-neotest/nvim-nio",
   },
   config = function()
-    require("nvim-dap-retro").setup()
+    local retro = require("nvim-dap-retro")
+    retro.setup()
+    require("dapui").setup({ layouts = retro.dapui_layout })
   end,
 }
 ```
-
-> **Note:** if you use nvim-dap-ui, let nvim-dap-retro call `dapui.setup()` — it owns the layout config. Remove any standalone `dapui.setup()` call from your dapui plugin config.
 
 ## Setup
 

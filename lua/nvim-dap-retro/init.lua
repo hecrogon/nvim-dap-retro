@@ -1,6 +1,6 @@
 local M = {}
 
-local dapui_layout = {
+M.dapui_layout = {
   {
     elements = {
       { id = "repl",        size = 0.05 },
@@ -50,8 +50,6 @@ M.setup = function(opts)
         return memory.buf()
       end,
     })
-    dapui.setup({ layouts = dapui_layout })
-
     dap.listeners.after.event_stopped["nvim-dap-retro"] = function()
       dapui.open()
     end
