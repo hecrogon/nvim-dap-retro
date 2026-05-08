@@ -219,13 +219,16 @@ class ZesaruxAdapter(DAPAdapter):
     def handle_configuration_done(self, msg):
         self._load_binary(getattr(self, '_source_path', None))
         self.zesarux_send(f'set-register PC={self._load_address:x}h')
-        self.start_monitor('breakpoint')
-        self.zesarux_run()
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
             'command': 'configurationDone',
             'success': True,
+        })
+        self.send({
+            'type': 'event',
+            'event': 'stopped',
+            'body': {'reason': 'entry', 'threadId': 1, 'allThreadsStopped': True},
         })
 
     def handle_read_memory(self, msg):

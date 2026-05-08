@@ -2,6 +2,7 @@ local M = {}
 
 local buf = nil
 local load_address = 0x4000
+local current_address = nil
 local byte_count = 256
 local _lines = {}
 
@@ -52,12 +53,17 @@ end
 local function refresh()
   local session = require("dap").session()
   if not session then return end
-  local cfg = session.config
-  local addr = load_address
-  if cfg and cfg.loadAddress then
-    addr = type(cfg.loadAddress) == "number" and cfg.loadAddress
-      or tonumber(cfg.loadAddress) or load_address
+
+  if not current_address then
+    local cfg = session.config
+    current_address = load_address
+    if cfg and cfg.loadAddress then
+      current_address = type(cfg.loadAddress) == "number" and cfg.loadAddress
+        or tonumber(cfg.loadAddress) or load_address
+    end
   end
+
+  local addr = current_address
   session:request("readMemory", {
     memoryReference = string.format("0x%04x", addr),
     count = byte_count,
@@ -68,15 +74,33 @@ local function refresh()
   end)
 end
 
+local function scroll(bytes)
+  current_address = (current_address or load_address) + bytes
+  current_address = math.max(0, math.min(0xFFFF - byte_count + 1, current_address))
+  refresh()
+end
+
 M.setup = function(opts)
   opts = opts or {}
   load_address = opts.load_address or 0x4000
   byte_count = opts.count or 256
 
+  local keymaps = vim.tbl_extend("force", {
+    page_down = "<C-f>",
+    page_up   = "<C-b>",
+    line_down = "j",
+    line_up   = "k",
+  }, opts.keymaps or {})
+
   buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(buf, "Memory Dump")
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+
+  vim.keymap.set("n", keymaps.page_down, function() scroll(byte_count) end,  { buffer = buf, desc = "Memory: page down" })
+  vim.keymap.set("n", keymaps.page_up,   function() scroll(-byte_count) end, { buffer = buf, desc = "Memory: page up" })
+  vim.keymap.set("n", keymaps.line_down, function() scroll(16) end,          { buffer = buf, desc = "Memory: line down" })
+  vim.keymap.set("n", keymaps.line_up,   function() scroll(-16) end,         { buffer = buf, desc = "Memory: line up" })
 
   require("dap").listeners.after.event_stopped["nvim-dap-retro.memory"] = refresh
 end
@@ -95,5 +119,6 @@ M.get_lines = function() return _lines end
 M.on_update = nil
 
 M.refresh = refresh
+M.scroll = scroll
 
 return M
