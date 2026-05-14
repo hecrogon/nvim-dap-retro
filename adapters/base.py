@@ -32,6 +32,7 @@ class DAPAdapter:
             'scopes':            self.handle_scopes,
             'variables':         self.handle_variables,
             'readMemory':        self.handle_read_memory,
+            'writeMemory':       self.handle_write_memory,
             'next':              self.handle_step,
             'stepIn':            self.handle_step,
             'continue':          self.handle_continue,
@@ -97,6 +98,7 @@ class DAPAdapter:
             'body': {
                 'supportsConfigurationDoneRequest': True,
                 'supportsReadMemoryRequest': True,
+                'supportsWriteMemoryRequest': True,
             },
         })
         self.send({'type': 'event', 'event': 'initialized'})
@@ -179,6 +181,9 @@ class DAPAdapter:
         raise NotImplementedError
 
     def handle_read_memory(self, msg):
+        raise NotImplementedError
+
+    def handle_write_memory(self, msg):
         raise NotImplementedError
 
     def handle_step(self, msg):

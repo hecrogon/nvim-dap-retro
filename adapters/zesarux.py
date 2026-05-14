@@ -256,6 +256,24 @@ class ZesaruxAdapter(DAPAdapter):
             },
         })
 
+    def handle_write_memory(self, msg):
+        args = msg['arguments']
+        address = int(args['memoryReference'], 16)
+        address += args.get('offset', 0)
+        data = base64.b64decode(args['data'])
+        hex_data = data.hex().upper()
+
+        logging.debug(f'ZRCP >>> write-memory-raw {address:x}h {hex_data}')
+        self._sock.sendall(f'write-memory-raw {address:x}h {hex_data}\n'.encode('ascii'))
+        self.zesarux_recv_until_prompt()
+        self.send({
+            'type': 'response',
+            'request_seq': msg['seq'],
+            'command': 'writeMemory',
+            'success': True,
+            'body': {'bytesWritten': len(data)},
+        })
+
     def handle_step(self, msg):
         logging.debug('ZRCP >>> cpu-step')
         self._sock.sendall(b'cpu-step\n')

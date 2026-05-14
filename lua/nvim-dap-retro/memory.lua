@@ -5,6 +5,7 @@ local load_address = 0x4000
 local current_address = nil
 local byte_count = 256
 local _lines = {}
+local _bytes = {}
 
 local function hex_dump(bytes, start_addr)
   local lines = {}
@@ -40,6 +41,7 @@ local function update(data, addr)
   for i = 1, #data do
     bytes[i] = data:byte(i)
   end
+  _bytes = bytes
   local lines = hex_dump(bytes, addr)
   _lines = lines
   if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -74,6 +76,53 @@ local function refresh()
   end)
 end
 
+local function byte_addr_at_cursor()
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  -- Line format: "AAAA: HH HH HH ..."
+  -- Hex area starts at col 6 (0-indexed). Each byte is 3 chars wide (HH + space).
+  if col < 6 then return nil end
+  local hex_col = col - 6
+  local byte_idx = math.floor(hex_col / 3)
+  if byte_idx >= 16 or hex_col % 3 == 2 then return nil end  -- on a space
+  local flat_idx = (row - 1) * 16 + byte_idx + 1            -- 1-indexed into _bytes
+  local addr = (current_address or load_address) + flat_idx - 1
+  if addr > 0xFFFF then return nil end
+  return addr, flat_idx
+end
+
+local function edit_byte()
+  local addr, flat_idx = byte_addr_at_cursor()
+  if not addr then return end
+  local session = require("dap").session()
+  if not session then return end
+  local current = _bytes[flat_idx]
+  local prompt = current
+    and string.format("Value at %04X [%02X] (hex): ", addr, current)
+    or  string.format("Value at %04X (hex): ", addr)
+  vim.ui.input({ prompt = prompt }, function(input)
+    if not input or input == "" then return end
+    local trimmed = vim.trim(input)
+    if trimmed:sub(1, 2):lower() == "0x" then
+      trimmed = trimmed:sub(3)
+    end
+    local value = tonumber(trimmed, 16)
+    if not value or value < 0 or value > 255 then
+      vim.notify("Invalid byte value (expected 00-FF)", vim.log.levels.ERROR)
+      return
+    end
+    session:request("writeMemory", {
+      memoryReference = string.format("0x%04x", addr),
+      data = vim.base64.encode(string.char(value)),
+    }, function(err)
+      if err then
+        vim.notify("writeMemory failed: " .. tostring(err), vim.log.levels.ERROR)
+        return
+      end
+      vim.schedule(refresh)
+    end)
+  end)
+end
+
 local function scroll(bytes)
   current_address = (current_address or load_address) + bytes
   current_address = math.max(0, math.min(0xFFFF - byte_count + 1, current_address))
@@ -90,6 +139,7 @@ M.setup = function(opts)
     page_up   = "<C-b>",
     line_down = "j",
     line_up   = "k",
+    edit_byte = "e",
   }, opts.keymaps or {})
 
   buf = vim.api.nvim_create_buf(false, true)
@@ -101,6 +151,7 @@ M.setup = function(opts)
   vim.keymap.set("n", keymaps.page_up,   function() scroll(-byte_count) end, { buffer = buf, desc = "Memory: page up" })
   vim.keymap.set("n", keymaps.line_down, function() scroll(16) end,          { buffer = buf, desc = "Memory: line down" })
   vim.keymap.set("n", keymaps.line_up,   function() scroll(-16) end,         { buffer = buf, desc = "Memory: line up" })
+  vim.keymap.set("n", keymaps.edit_byte, edit_byte,                          { buffer = buf, desc = "Memory: edit byte" })
 
   require("dap").listeners.after.event_stopped["nvim-dap-retro.memory"] = refresh
 end
