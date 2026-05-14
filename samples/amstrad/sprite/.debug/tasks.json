@@ -3,7 +3,7 @@
     {
       "label": "build",
       "command": "sh",
-      "args": ["-c", "mkdir -p build && sjasmplus --sld=build/sprite.sld --fullpath src/sprite.z80"]
+      "args": ["-c", "mkdir -p build && sjasmplus --sld=build/sprite.sld --fullpath src/sprite.asm"]
     }
   ]
 }

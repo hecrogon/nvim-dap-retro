@@ -12,7 +12,7 @@ A minimal Z80 assembly program for the Amstrad CPC 6128. Clears the screen, prin
 ```
 helloworld/
 ├── src/
-│   └── hello.z80       Z80 assembly source
+│   └── hello.asm       Z80 assembly source
 └── .debug/
     ├── launch.json     DAP debug configuration
     └── tasks.json      Build task (calls make build)
@@ -24,11 +24,11 @@ Assemble with sjasmplus:
 
 ```sh
 mkdir build
-sjasmplus --sld=build/hello.sld --fullpath src/hello.z80
+sjasmplus --sld=build/hello.sld --fullpath src/hello.asm
 ```
 
 The `.debug/tasks.json` already runs this command when you start a debug session.
 
 ## Debug
 
-Open `src/hello.z80` in Neovim and run `<leader>dzr`. The adapter will launch ZEsarUX automatically, load the binary at `0x4000`, and stop at the first breakpoint.
+Open `src/hello.asm` in Neovim and run `<leader>dzr`. The adapter will launch ZEsarUX automatically, load the binary at `0x4000`, and stop at the first breakpoint.

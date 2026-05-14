@@ -3,7 +3,7 @@
     {
       "label": "build",
       "command": "sh",
-      "args": ["-c", "mkdir -p build && sjasmplus --sld=build/displayimage.sld --fullpath src/displayimage.z80"]
+      "args": ["-c", "mkdir -p build && sjasmplus --sld=build/displayimage.sld --fullpath src/displayimage.asm"]
     }
   ]
 }
