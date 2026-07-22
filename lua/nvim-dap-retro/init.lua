@@ -23,6 +23,7 @@ M.dapui_layout = {
 M.ext_map = {
   z80       = "zesarux",
   s80       = "zesarux",
+  c         = "zesarux",
   a         = "vice",
   s         = "vice",
   ["65s"]   = "vice",

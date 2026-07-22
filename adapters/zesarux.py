@@ -26,6 +26,7 @@ class ZesaruxAdapter(DAPAdapter):
         self._setup_done = False
         self._active_breakpoints = set()
         self._stop_on_exit = True
+        self.map_file = None
 
     # ── ZRCP communication ────────────────────────────────────────────────────
 
@@ -67,9 +68,9 @@ class ZesaruxAdapter(DAPAdapter):
         return response
 
     def zesarux_recv_until_prompt(self):
-        """Block until ZEsarUX sends the command@ prompt."""
+        """Block until ZEsarUX sends a command prompt (command@ or command>)."""
         data = b''
-        while b'command@' not in data:
+        while b'command@' not in data and b'command>' not in data:
             chunk = self._sock.recv(4096)
             if not chunk:
                 break
@@ -125,9 +126,11 @@ class ZesaruxAdapter(DAPAdapter):
             self.bin_file = Path(args['program'])
         if 'sldFile' in args:
             self.sld_file = Path(args['sldFile'])
+        if 'mapFile' in args:
+            self.map_file = Path(args['mapFile'])
         if 'loadAddress' in args:
             self._load_address = int(str(args['loadAddress']), 0)
-        logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} load_address=0x{self._load_address:04x}')
+        logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} load_address=0x{self._load_address:04x}')
 
         if 'zesaruxArgs' in args:
             if self._is_running():
@@ -162,7 +165,8 @@ class ZesaruxAdapter(DAPAdapter):
     def _load_binary(self, source_path=None):
         if self._setup_done:
             return
-        if self.bin_file is None or self.sld_file is None:
+        has_debug = self.sld_file is not None or self.map_file is not None
+        if self.bin_file is None or not has_debug:
             if source_path is None:
                 logging.error('No source path available to resolve bin/sld files')
                 return
@@ -171,9 +175,19 @@ class ZesaruxAdapter(DAPAdapter):
             name = sp.stem
             resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
             resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
+            resolved_map = self.map_file
         else:
             resolved_bin = self.bin_file
             resolved_sld = self.sld_file
+            resolved_map = self.map_file
+
+        if resolved_map is not None:
+            self.sld_map, self.address_to_line, map_load_address = self.parse_map(resolved_map)
+            if map_load_address is not None:
+                self._load_address = map_load_address
+                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
+        elif resolved_sld is not None:
+            self.sld_map, self.address_to_line = self.parse_sld(resolved_sld)
 
         logging.debug(f'ZRCP >>> load-binary {resolved_bin} {self._load_address:x}h 0')
         self._sock.sendall(f'load-binary {resolved_bin} {self._load_address:x}h 0\n'.encode('ascii'))
@@ -181,7 +195,6 @@ class ZesaruxAdapter(DAPAdapter):
         logging.debug('ZRCP >>> enable-breakpoints')
         self._sock.sendall(b'enable-breakpoints\n')
         self.zesarux_recv_until_prompt()
-        self.sld_map, self.address_to_line = self.parse_sld(resolved_sld)
         self._setup_done = True
 
     def handle_set_breakpoints(self, msg):

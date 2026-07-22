@@ -63,7 +63,7 @@ class DAPAdapter:
         logging.debug(f'>>> {body}')
         return json.loads(body)
 
-    # ── SLD parsing ───────────────────────────────────────────────────────────
+    # ── SLD parsing (sjasmplus) ───────────────────────────────────────────────
 
     def parse_sld(self, sld_path):
         line_to_addr = {}
@@ -80,6 +80,49 @@ class DAPAdapter:
                     except ValueError:
                         pass
         return line_to_addr, addr_to_line
+
+    # ── MAP parsing (SDCC) ────────────────────────────────────────────────────
+
+    def parse_map(self, map_path):
+        """Parse SDCC linker .map file for C-level line → address mapping.
+
+        With --debug, SDCC embeds C$ records in the map file:
+            00004000  C$main.c$3$0_0$79    main
+        Format: C$<filename>$<lineno>$<level>_<block>$<col>
+
+        Also extracts the load address from the s__CODE symbol:
+            00004000  s__CODE
+
+        Returns (line_to_addr, addr_to_line, load_address).
+        load_address is None if s__CODE is not found.
+        """
+        line_to_addr = {}
+        addr_to_line = {}
+        load_address = None
+        with open(map_path) as f:
+            for raw in f:
+                parts = raw.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    addr = int(parts[0], 16)
+                except ValueError:
+                    continue
+                if parts[1] == 's__CODE' and load_address is None:
+                    load_address = addr
+                elif parts[1].startswith('C$'):
+                    try:
+                        fields = parts[1].split('$')
+                        line_num = int(fields[2])
+                        if line_num not in line_to_addr:
+                            line_to_addr[line_num] = addr
+                        if addr not in addr_to_line:
+                            addr_to_line[addr] = line_num
+                    except (ValueError, IndexError):
+                        pass
+        return line_to_addr, addr_to_line, load_address
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def snap_to_valid_line(self, line):
         for offset in range(0, 20):
