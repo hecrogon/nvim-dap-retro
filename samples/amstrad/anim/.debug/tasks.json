@@ -1,0 +1,9 @@
+{
+  "tasks": [
+    {
+      "label": "build",
+      "command": "sh",
+      "args": ["-c", "mkdir -p build && sjasmplus --sld=build/anim.sld --fullpath src/anim.asm"]
+    }
+  ]
+}

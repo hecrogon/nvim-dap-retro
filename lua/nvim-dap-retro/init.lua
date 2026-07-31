@@ -4,17 +4,18 @@ M.dapui_layout = {
   {
     elements = {
       { id = "repl",        size = 0.05 },
-      { id = "scopes",      size = 0.25 },
-      { id = "breakpoints", size = 0.25 },
-      { id = "stacks",      size = 0.25 },
+      { id = "scopes",      size = 0.20 },
+      { id = "breakpoints", size = 0.20 },
+      { id = "stacks",      size = 0.20 },
       { id = "watches",     size = 0.15 },
       { id = "expressions", size = 0.05 },
+      { id = "memory_dump", size = 0.15 },
     },
     size = 40,
     position = "left",
   },
   {
-    elements = { "memory_dump" },
+    elements = { "build_log" },
     size = 10,
     position = "bottom",
   },
@@ -23,6 +24,7 @@ M.dapui_layout = {
 M.ext_map = {
   z80       = "zesarux",
   s80       = "zesarux",
+  c         = "zesarux",
   a         = "vice",
   s         = "vice",
   ["65s"]   = "vice",
@@ -38,8 +40,10 @@ M.setup = function(opts)
   require("nvim-dap-retro.adapters.vice").setup(dap)
   require("nvim-dap-retro.adapters.mame").setup(dap)
 
-  local memory = require("nvim-dap-retro.memory")
+  local memory    = require("nvim-dap-retro.memory")
+  local build_log = require("nvim-dap-retro.build_log")
   memory.setup(opts.memory or {})
+  build_log.setup()
 
   local ok, dapui = pcall(require, "dapui")
   if ok then
@@ -49,6 +53,12 @@ M.setup = function(opts)
       end,
       buffer = function()
         return memory.buf()
+      end,
+    })
+    dapui.register_element("build_log", {
+      render = function() end,
+      buffer = function()
+        return build_log.buf()
       end,
     })
     dap.listeners.after.event_stopped["nvim-dap-retro"] = function()
@@ -83,11 +93,17 @@ local function resolve_task(label)
 end
 
 local function run_task(task, on_success)
+  local build_log = require("nvim-dap-retro.build_log")
+  build_log.clear()
+
   local args = task.args or {}
   local cmd = #args > 0 and vim.list_extend({ task.command }, args) or task.command
   vim.notify("nvim-dap-retro: running task '" .. task.label .. "'")
   vim.fn.jobstart(cmd, {
+    on_stdout = function(_, data) build_log.append(data) end,
+    on_stderr = function(_, data) build_log.append(data) end,
     on_exit = function(_, exit_code)
+      build_log.flush()
       if exit_code ~= 0 then
         vim.notify("nvim-dap-retro: task '" .. task.label .. "' failed (exit code " .. exit_code .. ")", vim.log.levels.ERROR)
         return
