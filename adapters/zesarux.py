@@ -27,6 +27,7 @@ class ZesaruxAdapter(DAPAdapter):
         self._active_breakpoints = set()
         self._stop_on_exit = True
         self.map_file = None
+        self.cdb_file = None
 
     # ── ZRCP communication ────────────────────────────────────────────────────
 
@@ -100,6 +101,17 @@ class ZesaruxAdapter(DAPAdapter):
             regs[match.group(1)] = int(match.group(2), 16)
         return regs
 
+    def read_memory_bytes(self, address, count):
+        self._sock.sendall(f'read-memory {address:x}h {count}\n'.encode('ascii'))
+        parts = self.zesarux_recv_until_prompt().split()
+        if not parts:
+            return None
+        try:
+            hex_str = parts[0]
+            return bytes(int(hex_str[i:i+2], 16) for i in range(0, len(hex_str), 2))
+        except (ValueError, IndexError):
+            return None
+
     # ── Stop monitor ──────────────────────────────────────────────────────────
 
     def _monitor_breakpoint(self, reason):
@@ -128,9 +140,14 @@ class ZesaruxAdapter(DAPAdapter):
             self.sld_file = Path(args['sldFile'])
         if 'mapFile' in args:
             self.map_file = Path(args['mapFile'])
+            candidate = self.map_file.with_suffix('.cdb')
+            if candidate.exists():
+                self.cdb_file = candidate
+        if 'cdbFile' in args:
+            self.cdb_file = Path(args['cdbFile'])
         if 'loadAddress' in args:
             self._load_address = int(str(args['loadAddress']), 0)
-        logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} load_address=0x{self._load_address:04x}')
+        logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} cdb_file={self.cdb_file} load_address=0x{self._load_address:04x}')
 
         if 'zesaruxArgs' in args:
             if self._is_running():
@@ -182,12 +199,18 @@ class ZesaruxAdapter(DAPAdapter):
             resolved_map = self.map_file
 
         if resolved_map is not None:
-            self.sld_map, self.address_to_line, map_load_address = self.parse_map(resolved_map)
+            self.sld_map, self.address_to_source, map_load_address = self.parse_map(resolved_map)
             if map_load_address is not None:
                 self._load_address = map_load_address
                 logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
         elif resolved_sld is not None:
-            self.sld_map, self.address_to_line = self.parse_sld(resolved_sld)
+            self.sld_map, self.address_to_source = self.parse_sld(resolved_sld)
+
+        if self.cdb_file is not None:
+            cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
+            self.sld_map.update(cdb_lines)
+            self.address_to_source.update(cdb_addrs)
+            logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
 
         logging.debug(f'ZRCP >>> load-binary {resolved_bin} {self._load_address:x}h 0')
         self._sock.sendall(f'load-binary {resolved_bin} {self._load_address:x}h 0\n'.encode('ascii'))
@@ -199,15 +222,17 @@ class ZesaruxAdapter(DAPAdapter):
 
     def handle_set_breakpoints(self, msg):
         self._source_path = msg['arguments']['source']['path']
+        self._register_source_path(self._source_path)
         self._load_binary(self._source_path)
 
+        basename = Path(self._source_path).name
         new_indices = set()
         breakpoints = []
         for i, bp in enumerate(msg['arguments'].get('breakpoints', []), start=1):
             line = bp['line']
-            valid_line = self.snap_to_valid_line(line)
+            valid_line = self.snap_to_valid_line(basename, line)
             if valid_line is not None:
-                address = self.sld_map[valid_line]
+                address = self.sld_map[(basename, valid_line)]
                 self.zesarux_send(f'set-breakpointaction {i}')
                 self.zesarux_send(f'set-breakpoint {i} PC={address:x}h')
                 self.zesarux_send(f'enable-breakpoint {i}')
@@ -231,7 +256,8 @@ class ZesaruxAdapter(DAPAdapter):
 
     def handle_configuration_done(self, msg):
         self._load_binary(getattr(self, '_source_path', None))
-        self.zesarux_send(f'set-register PC={self._load_address:x}h')
+        entry = next((start for name, start, end in self.functions if name == 'main'), self._load_address)
+        self.zesarux_send(f'set-register PC={entry:x}h')
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],

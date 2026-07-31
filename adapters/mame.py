@@ -160,6 +160,7 @@ class MameAdapter(DAPAdapter):
 
     def handle_set_breakpoints(self, msg):
         self._source_path = msg['arguments']['source']['path']
+        self._register_source_path(self._source_path)
 
         if self.sld_file is None and self._source_path:
             source_path = Path(self._source_path)
@@ -167,22 +168,23 @@ class MameAdapter(DAPAdapter):
             self.sld_file = project_root / 'build' / f'{source_path.stem}.sld'
 
         if self.sld_file and self.sld_file.exists() and not self.sld_map:
-            self.sld_map, self.address_to_line = self.parse_sld(self.sld_file)
+            self.sld_map, self.address_to_source = self.parse_sld(self.sld_file)
 
         for addr in self._active_breakpoints.values():
             resp = self.gdb_cmd(f'z0,{addr:x},1')
             logging.debug(f'Removed BP at {addr:#x}: {resp}')
         self._active_breakpoints = {}
 
+        basename = Path(self._source_path).name
         breakpoints = []
         for bp in msg['arguments'].get('breakpoints', []):
             line = bp['line']
-            valid_line = self.snap_to_valid_line(line)
+            valid_line = self.snap_to_valid_line(basename, line)
             if valid_line is not None:
-                address = self.sld_map[valid_line]
+                address = self.sld_map[(basename, valid_line)]
                 resp = self.gdb_cmd(f'Z0,{address:x},1')
                 if resp == 'OK':
-                    self._active_breakpoints[valid_line] = address
+                    self._active_breakpoints[(basename, valid_line)] = address
                     breakpoints.append({'verified': True, 'line': valid_line})
                     logging.debug(f'BP line {line} -> {valid_line} -> {address:#x}')
                 else:
@@ -205,7 +207,7 @@ class MameAdapter(DAPAdapter):
             self._set_pc(self._load_address)
 
         if self.sld_file and self.sld_file.exists() and not self.sld_map:
-            self.sld_map, self.address_to_line = self.parse_sld(self.sld_file)
+            self.sld_map, self.address_to_source = self.parse_sld(self.sld_file)
 
         self.gdb_send('c')
         self.start_monitor('entry')

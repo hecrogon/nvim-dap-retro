@@ -2,6 +2,15 @@
 
 u8 sumUpTo(u8 n);
 
+// Sum 1..n — a simple function useful for breakpoint and step-through testing
+u8 sumUpTo(u8 n) {
+    u8 i, total = 0;
+    for (i = 1; i <= n; i++) {
+        total += i;
+    }
+    return total;
+}
+
 void main(void) {
     u8 result;
 
@@ -23,13 +32,4 @@ void main(void) {
     cpct_memset(CPCT_VMEM_START, 0xFF, (u16)result * 2);
 
     while(1) {}
-}
-
-// Sum 1..n — a simple function useful for breakpoint and step-through testing
-u8 sumUpTo(u8 n) {
-    u8 i, total = 0;
-    for (i = 1; i <= n; i++) {
-        total += i;
-    }
-    return total;
 }
