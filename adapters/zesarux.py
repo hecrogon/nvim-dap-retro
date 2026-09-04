@@ -25,6 +25,7 @@ class ZesaruxAdapter(DAPAdapter):
         self._sock = None
         self._process = None
         self._setup_done = False
+        self._machine_name = ''
         self._active_breakpoints = set()
         self._stop_on_exit = True
         self.map_file = None
@@ -50,6 +51,33 @@ class ZesaruxAdapter(DAPAdapter):
             except (ConnectionRefusedError, OSError):
                 time.sleep(0.5)
         raise RuntimeError(f'ZEsarUX did not start within {timeout}s')
+
+    @staticmethod
+    def _find_free_port():
+        """Ask the OS for a free local TCP port by binding to port 0, then
+        release it immediately so ZEsarUX can bind it instead. There's a
+        small window between closing this socket and ZEsarUX claiming the
+        same port (TOCTOU), but for local single-user debugging sessions
+        that race is negligible.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    def _launch_zesarux(self, args):
+        """Spawn a ZEsarUX process listening on self._zesarux_port.
+
+        --remoteprotocol-port is appended *after* the user's own
+        zesaruxArgs, so it wins if they happened to also set one there --
+        keeping this adapter's own idea of the port authoritative, since
+        it's what handle_launch is about to connect self._sock to.
+        """
+        zesarux_bin = args.get('zesaruxPath', 'zesarux')
+        launch_cmd = [zesarux_bin, '--noconfigfile', '--enable-remoteprotocol'] + args['zesaruxArgs'] \
+            + ['--remoteprotocol-port', str(self._zesarux_port)]
+        logging.debug(f'Launching ZEsarUX: {launch_cmd}')
+        self._process = subprocess.Popen(launch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._wait_for_zesarux()
 
     def zesarux_recv(self):
         """Timed recv for regular commands (ZEsarUX is stopped)."""
@@ -102,6 +130,20 @@ class ZesaruxAdapter(DAPAdapter):
             regs[match.group(1)] = int(match.group(2), 16)
         return regs
 
+    def write_register(self, name, value):
+        """`set-register NAME=VALUEh` -- accepts PC/SP/IX/IY/AF/BC/DE/HL
+        (+ their ' shadows), the 8-bit halves, and I/R/IFF1/IFF2 (verified
+        against ZEsarUX's own debug_change_register() source). MEMPTR and
+        MMU are shown in the Registers scope (read_registers regex-matches
+        whatever get-registers reports) but aren't real settable registers
+        -- ZEsarUX just replies "Error changing register" for those, which
+        this reports back as a normal write failure.
+        """
+        logging.debug(f'ZRCP >>> set-register {name}={value:x}h')
+        self._sock.sendall(f'set-register {name}={value:x}h\n'.encode('ascii'))
+        response = self.zesarux_recv_until_prompt()
+        return 'error' not in response.lower()
+
     def read_memory_bytes(self, address, count):
         self._sock.sendall(f'read-memory {address:x}h {count}\n'.encode('ascii'))
         parts = self.zesarux_recv_until_prompt().split()
@@ -118,12 +160,6 @@ class ZesaruxAdapter(DAPAdapter):
     def _monitor_breakpoint(self, reason):
         response = self.zesarux_recv_until_prompt()
         logging.debug(f'ZEsarUX stopped ({reason}): {response}')
-        # ZEsarUX pops its own native "Debug" window on every stop even with
-        # --disable-debug-console-win passed at launch (that flag alone did
-        # not stop it in practice) -- close it every time so it doesn't pile
-        # up/steal focus while something else (this adapter) is driving the
-        # session over ZRCP. Same command handle_launch already sends once
-        # at startup, just repeated on every stop instead of only then.
         self.zesarux_send('close-all-menus')
         self.send({
             'type': 'event',
@@ -159,18 +195,36 @@ class ZesaruxAdapter(DAPAdapter):
         logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} cdb_file={self.cdb_file} load_address=0x{self._load_address:04x}')
 
         if 'zesaruxArgs' in args:
-            if self._is_running():
-                logging.debug('ZEsarUX already running, skipping launch')
+            if 'zesaruxPort' in args:
+                # Explicit port -- the user wants this specific instance
+                # (possibly one they're sharing across sessions on purpose).
+                # Preserve the original attach-if-already-running behavior.
+                if self._is_running():
+                    logging.debug('ZEsarUX already running, skipping launch')
+                else:
+                    self._launch_zesarux(args)
             else:
-                zesarux_bin = args.get('zesaruxPath', 'zesarux')
-                launch_cmd = [zesarux_bin, '--noconfigfile', '--enable-remoteprotocol'] + args['zesaruxArgs']
-                logging.debug(f'Launching ZEsarUX: {launch_cmd}')
-                self._process = subprocess.Popen(launch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self._wait_for_zesarux()
+                # No port requested -- launch our own dedicated instance on
+                # a freshly picked free port instead of the shared default
+                # 10000. A second concurrent debug() call (a different
+                # buffer, a session left dangling) would otherwise silently
+                # corrupt this one: hard-reset-cpu resets the machine and
+                # clear-membreakpoints wipes breakpoints out from under
+                # whichever session got there first, since ZEsarUX has no
+                # concept of "sessions" -- one process is one shared Z80
+                # core no matter how many ZRCP clients connect to it. Two
+                # separate processes on two separate ports have nothing to
+                # collide over.
+                self._zesarux_port = self._find_free_port()
+                self._launch_zesarux(args)
 
         self._sock = socket.create_connection((self._zesarux_host, self._zesarux_port))
         logging.debug('Connected to ZEsarUX')
         self.zesarux_recv()  # drain welcome banner
+        # zesarux_send's reply includes the trailing ZRCP prompt (e.g.
+        # "ZX Spectrum 48k\ncommand>") -- only the first line is the answer.
+        self._machine_name = self.zesarux_send('get-current-machine').splitlines()[0].strip().lower()
+        logging.debug(f'ZEsarUX machine: {self._machine_name!r}')
         self.zesarux_send('close-all-menus')
         self.zesarux_send('hard-reset-cpu')
         self.zesarux_send('enter-cpu-step')
@@ -425,6 +479,70 @@ class ZesaruxAdapter(DAPAdapter):
         response = data.decode('ascii', errors='replace').strip()
         logging.debug(f'ZRCP <<< {response}')
         return response
+
+    # ── CRTC registers scope ─────────────────────────────────────────────────
+    #
+    # ZRCP has no dedicated "get CRTC registers" command -- they're one
+    # section of the much broader `get-io-ports` dump (floppy controller,
+    # PPI, Gate Array, AY-3-8912 sound chip, ...), verified live against a
+    # real ZEsarUX instance. Exposed as its own DAP scope (alongside
+    # Registers/Locals/Globals from base.py) rather than requiring
+    # `zrcp get-io-ports` in the debug console every time.
+
+    _CRTC_SCOPE_REF = 4
+
+    def extra_scopes(self):
+        # Only CPC targets actually have a CRTC chip -- 'get-current-machine'
+        # is queried once at launch (see handle_launch) and cached, so this
+        # doesn't cost a round-trip on every scopes request. Without this
+        # check every other ZEsarUX target (Spectrum, etc.) would show an
+        # always-empty "CRTC" scope, which is just noise.
+        if 'cpc' not in self._machine_name:
+            return []
+        return [{'name': 'CRTC', 'variablesReference': self._CRTC_SCOPE_REF, 'expensive': False}]
+
+    def extra_scope_variables(self, ref):
+        if ref == self._CRTC_SCOPE_REF:
+            self._sock.sendall(b'get-io-ports\n')
+            return self._parse_crtc_registers(self.zesarux_recv_until_prompt())
+        return []
+
+    @staticmethod
+    def _parse_crtc_registers(response):
+        """Pull just the "CRTC Registers:" block out of a get-io-ports
+        response:
+            CRTC Registers:
+            00:  3F
+            01:  28
+            ...
+            1F:  00
+
+            PPI Port A:  00
+            ...
+        Stops at the first blank line (or anything that doesn't match a
+        register line) after the header. Returns [] on a non-CPC/PCW
+        machine, where get-io-ports has no CRTC section at all -- the
+        scope just shows empty rather than erroring.
+        """
+        variables = []
+        in_block = False
+        for line in response.splitlines():
+            if line.strip() == 'CRTC Registers:':
+                in_block = True
+                continue
+            if not in_block:
+                continue
+            match = re.match(r'^([0-9A-Fa-f]{2}):\s+([0-9A-Fa-f]{2})$', line.strip())
+            if not match:
+                break
+            reg_num, value = match.groups()
+            variables.append({
+                'name': f'R{reg_num}',
+                'value': f'0x{value}',
+                'type': 'register',
+                'variablesReference': 0,
+            })
+        return variables
 
     def handle_step(self, msg):
         logging.debug('ZRCP >>> cpu-step')
