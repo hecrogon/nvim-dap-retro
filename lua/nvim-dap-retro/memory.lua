@@ -123,10 +123,91 @@ local function edit_byte()
   end)
 end
 
+local function clamp_address(addr)
+  return math.max(0, math.min(0xFFFF - byte_count + 1, addr))
+end
+
+-- "48656c6c6f" or "48 65 6c 6c 6f" (optionally "0x"-prefixed) -> {0x48,0x65,...}.
+-- Returns nil if the input isn't an even number of hex digits.
+local function parse_hex_bytes(input)
+  local hex = input:gsub("%s+", ""):gsub("^0[xX]", "")
+  if hex == "" or #hex % 2 ~= 0 then return nil end
+  local bytes = {}
+  for i = 1, #hex, 2 do
+    local byte = tonumber(hex:sub(i, i + 1), 16)
+    if not byte then return nil end
+    table.insert(bytes, byte)
+  end
+  return bytes
+end
+
+-- Search _bytes (1-indexed) for `needle`, starting at `start_idx` and
+-- wrapping to the beginning if not found before the end -- same
+-- forward-with-wraparound order as Neovim's own "/" search, just scoped
+-- to the currently loaded window rather than a whole buffer.
+local function find_bytes(needle, start_idx)
+  local n, m = #_bytes, #needle
+  if m == 0 or n == 0 or m > n then return nil end
+  local function match_at(idx)
+    for j = 1, m do
+      if _bytes[idx + j - 1] ~= needle[j] then return false end
+    end
+    return true
+  end
+  for idx = start_idx, n - m + 1 do
+    if match_at(idx) then return idx end
+  end
+  for idx = 1, math.min(start_idx - 1, n - m + 1) do
+    if match_at(idx) then return idx end
+  end
+  return nil
+end
+
+local function search_bytes()
+  vim.ui.input({ prompt = "Search hex bytes: " }, function(input)
+    if not input or input == "" then return end
+    local needle = parse_hex_bytes(input)
+    if not needle then
+      vim.notify("Invalid hex byte sequence (e.g. 48656c6c6f or 48 65 6c 6c 6f)", vim.log.levels.ERROR)
+      return
+    end
+    local _, cursor_idx = byte_addr_at_cursor()
+    local start_idx = (cursor_idx or 0) + 1
+    if start_idx > #_bytes then start_idx = 1 end
+    local found_idx = find_bytes(needle, start_idx)
+    if not found_idx then
+      vim.notify("Pattern not found in the currently loaded window (" .. #_bytes .. " bytes)", vim.log.levels.WARN)
+      return
+    end
+    local row = math.floor((found_idx - 1) / 16) + 1
+    local col = 6 + ((found_idx - 1) % 16) * 3
+    vim.api.nvim_win_set_cursor(0, { row, col })
+  end)
+end
+
 local function scroll(bytes)
-  current_address = (current_address or load_address) + bytes
-  current_address = math.max(0, math.min(0xFFFF - byte_count + 1, current_address))
+  current_address = clamp_address((current_address or load_address) + bytes)
   refresh()
+end
+
+-- Parse a hex address the same way edit_byte parses a hex byte value:
+-- optional "0x" prefix, otherwise bare hex digits (so both "C000" and
+-- "0xC000" work, matching how addresses are already shown in the dump).
+local function jump_to_address()
+  vim.ui.input({ prompt = "Jump to address (hex): " }, function(input)
+    if not input or input == "" then return end
+    local trimmed = vim.trim(input)
+    if trimmed:sub(1, 2):lower() == "0x" then
+      trimmed = trimmed:sub(3)
+    end
+    local addr = tonumber(trimmed, 16)
+    if not addr or addr < 0 or addr > 0xFFFF then
+      vim.notify("Invalid address (expected 16-bit hex, e.g. C000 or 0xC000)", vim.log.levels.ERROR)
+      return
+    end
+    current_address = clamp_address(addr)
+    refresh()
+  end)
 end
 
 M.setup = function(opts)
@@ -135,11 +216,13 @@ M.setup = function(opts)
   byte_count = opts.count or 256
 
   local keymaps = vim.tbl_extend("force", {
-    page_down = "<C-f>",
-    page_up   = "<C-b>",
-    line_down = "j",
-    line_up   = "k",
-    edit_byte = "e",
+    page_down       = "<C-f>",
+    page_up         = "<C-b>",
+    line_down       = "j",
+    line_up         = "k",
+    edit_byte       = "e",
+    jump_to_address = "a",
+    search_bytes    = "/",
   }, opts.keymaps or {})
 
   buf = vim.api.nvim_create_buf(false, true)
@@ -152,6 +235,8 @@ M.setup = function(opts)
   vim.keymap.set("n", keymaps.line_down, function() scroll(16) end,          { buffer = buf, desc = "Memory: line down" })
   vim.keymap.set("n", keymaps.line_up,   function() scroll(-16) end,         { buffer = buf, desc = "Memory: line up" })
   vim.keymap.set("n", keymaps.edit_byte, edit_byte,                          { buffer = buf, desc = "Memory: edit byte" })
+  vim.keymap.set("n", keymaps.jump_to_address, jump_to_address,              { buffer = buf, desc = "Memory: jump to address" })
+  vim.keymap.set("n", keymaps.search_bytes,    search_bytes,                 { buffer = buf, desc = "Memory: search hex bytes" })
 
   require("dap").listeners.after.event_stopped["nvim-dap-retro.memory"] = refresh
 end

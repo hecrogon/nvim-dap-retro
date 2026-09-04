@@ -1,6 +1,7 @@
 import sys
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 
@@ -18,11 +19,15 @@ class DAPAdapter:
         self.address_to_source = {} # {address: (basename, lineno)}
         self._path_cache = {}       # {basename: full_path}
         self._source_path = None
+        self._last_frame = None     # (source_path, line) last resolved from address_to_source
+        self._module_source_cache = {}  # {obj_path: full_path or None}
+        self._project_stem_index = None # lazily built {file_stem: full_path}, see _resolve_module_source
         self._load_address = 0
         self.bin_file = None
         self.sld_file = None
         self.functions = []     # [(name, start_addr, end_addr)]
         self.local_vars = {}    # {funcname: [{name, storage, register|sp_offset}]}
+        self.globals = []       # [{name, address, equ}] top-level SLD labels, see parse_sld
         self._stdout_lock = threading.Lock()
 
         self.HANDLERS = {
@@ -36,6 +41,7 @@ class DAPAdapter:
             'variables':         self.handle_variables,
             'readMemory':        self.handle_read_memory,
             'writeMemory':       self.handle_write_memory,
+            'evaluate':          self.handle_evaluate,
             'next':              self.handle_step,
             'stepIn':            self.handle_step,
             'continue':          self.handle_continue,
@@ -71,17 +77,46 @@ class DAPAdapter:
     def parse_sld(self, sld_path):
         """Parse sjasmplus SLD file.
 
-        SLD record format: filepath|line|col|page|address|...|T
-        The filepath in parts[0] is the full (absolute) path — we use its
-        basename as the key so it matches the same scheme as .map/.cdb,
-        and cache the full path for later source resolution.
+        SLD record format (8 pipe-delimited fields):
+            <source file>|<src line>|<def file>|<def line>|<page>|<value>|<type>|<data>
+        Only two types matter here: 'T' (instruction Trace -- one line of
+        real emitted code, the only type carrying a breakpointable
+        address) and 'L' (Label -- a code label or `equ`, see
+        _parse_sld_label). 'D'/'F' are older, now-redundant variants of
+        'L' the spec says to treat as 'L' as well, but sjasmplus already
+        emits a same-address 'L' line for everything 'D'/'F' would cover,
+        so there is nothing to gain from also parsing them. 'Z' (memory
+        model) and 'K' (keyword comment) carry no address/line data.
+
+        The filepath in field 0 is whatever path sjasmplus was invoked
+        with -- often relative to the project root (e.g. "src/hello.asm"),
+        not absolute, if the build ran with the project root as its cwd.
+        Caching a relative path as-is here clobbers the correct absolute
+        path handle_set_breakpoints already registered for the file whose
+        breakpoint triggered this parse, and nvim then can't find the file
+        at all when a stopped event names it (it resolves against nvim's
+        own cwd, not the build's) -- the source window just goes blank.
+        Resolve against the project root (the .sld file's own grandparent
+        directory, e.g. build/hello.sld -> project root) whenever the
+        recorded path isn't already absolute.
+
+        Also sets self.functions and self.globals from the 'L' records --
+        self.functions so stack frames get a real label name instead of
+        falling back to "PC=0x...." the way SDCC's .cdb already does for
+        C builds (see _labels_to_functions); self.globals so the DAP
+        Globals scope has something to show (see _global_variables).
         """
         line_to_addr = {}
         addr_to_source = {}
+        labels = []
+        project_root = Path(sld_path).resolve().parent.parent
         with open(sld_path) as f:
             for line in f:
                 parts = line.strip().split('|')
-                if len(parts) >= 7 and parts[6] == 'T':
+                if len(parts) < 7:
+                    continue
+                rtype = parts[6]
+                if rtype == 'T':
                     try:
                         full_path = parts[0]
                         basename  = Path(full_path).name
@@ -91,10 +126,73 @@ class DAPAdapter:
                         line_to_addr[key] = address
                         addr_to_source[address] = key
                         if full_path:
+                            if not Path(full_path).is_absolute():
+                                full_path = str(project_root / full_path)
                             self._path_cache[basename] = full_path
                     except ValueError:
                         pass
+                elif rtype == 'L':
+                    self._parse_sld_label(parts, labels)
+        self.globals = labels
+        self.functions = self._labels_to_functions(
+            [(g['name'], g['address']) for g in labels if not g['equ']]
+        )
         return line_to_addr, addr_to_source
+
+    @staticmethod
+    def _parse_sld_label(parts, labels):
+        """Extract one 'L' record into {'name','address','equ'}, appended
+        to `labels`.
+
+        Data field (parts[7]) format: module,mainLabel,localLabel[,+trait...]
+        -- see the SLD spec's list of traits (+local, +equ, +macro, +used,
+        ...). Local sub-labels (localLabel non-empty, e.g. a `.loop` label
+        scoped under the preceding global label) are skipped entirely --
+        not a real global symbol, just a detail inside one; _func_name_at
+        should still report the enclosing global label while PC is inside
+        it, and the Globals scope has no use for internal loop counters.
+        '+equ' labels are kept (unlike in _labels_to_functions -- an EQU
+        constant, e.g. a hardware register address, is exactly the kind of
+        thing worth showing in a Globals scope) but tagged so callers can
+        tell a constant's *value* apart from a label's *address*.
+        Module-qualified names (module non-empty) are rendered "module.label"
+        to match sjasmplus's own qualified-name convention.
+        """
+        try:
+            address = int(parts[5])
+        except (ValueError, IndexError):
+            return
+        data = parts[7] if len(parts) > 7 else ''
+        fields = data.split(',')
+        if len(fields) < 3:
+            return
+        module, main_label, local_label = fields[0], fields[1], fields[2]
+        traits = fields[3:]
+        if local_label or not main_label:
+            return
+        name = f'{module}.{main_label}' if module else main_label
+        labels.append({'name': name, 'address': address, 'equ': '+equ' in traits})
+
+    @staticmethod
+    def _labels_to_functions(labels):
+        """Turn address-ordered (name, address) code labels into (name,
+        start, end) ranges for _func_name_at: each label "owns" every
+        address up to the next label's start.
+
+        SLD has no explicit function-boundary concept (a label is just an
+        address with a name) -- this is an approximation good enough for
+        naming a stack frame, not a substitute for real function-range
+        debug info like SDCC's .cdb G$/XG$ pairs provide. In particular a
+        label marking a data table, not a routine, would still "own" a
+        range here; harmless in practice since PC only ever lands on
+        addresses that are actually executed.
+        """
+        ordered = sorted(set(labels), key=lambda item: item[1])
+        functions = []
+        for i, (name, start) in enumerate(ordered):
+            end = ordered[i + 1][1] - 1 if i + 1 < len(ordered) else 0xFFFF
+            functions.append((name, start, end))
+        return functions
 
     # ── MAP parsing (SDCC) ────────────────────────────────────────────────────
 
@@ -105,8 +203,17 @@ class DAPAdapter:
             00004000  C$main.c$3$0_0$79    main
         Format: C$<filename>$<lineno>$<level>_<block>$<col>
 
-        Also extracts the load address from the s__CODE symbol:
+        Also extracts a load address from the s__CODE symbol:
             00004000  s__CODE
+
+        This is only correct when _CODE is the lowest area in the linked
+        image, which is not always true -- a project can add its own (ABS)
+        area at a lower address (e.g. to .incbin a blob at a fixed spot).
+        ASxxxx's map output reports such (ABS,CON) areas' addresses as 0 in
+        every summary table, so there is no way to find their real address
+        from the .map file at all. parse_ihx_load_address() reads the true
+        minimum address straight from the .ihx and should be preferred
+        whenever a .ihx is available; this s__CODE guess is the fallback.
 
         Returns (line_to_addr, addr_to_line, load_address).
         load_address is None if s__CODE is not found.
@@ -138,6 +245,216 @@ class DAPAdapter:
                     except (ValueError, IndexError):
                         pass
         return line_to_addr, addr_to_line, load_address
+
+    @staticmethod
+    def parse_ihx_load_address(ihx_path):
+        """Read the true lowest address in a linked Intel HEX (.ihx) file.
+
+        This is what hex2bin itself uses to decide where byte 0 of the .bin
+        goes, so it is authoritative -- unlike guessing from the .map file's
+        s__CODE symbol, it is correct even when the lowest area in the image
+        is an (ABS) area sdld doesn't report a real address for (see
+        parse_map's docstring). Records are not guaranteed to appear in
+        address order, so every type-00 (data) record is scanned; type-01
+        (EOF) and any others are ignored. Assumes flat 16-bit addressing
+        (true for a Z80 target, which never emits 02/04 extended-address
+        records) -- an .ihx using those would need them folded in here.
+
+        Returns None if the file doesn't exist or has no data records.
+        """
+        try:
+            min_addr = None
+            with open(ihx_path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line.startswith(':') or len(line) < 11:
+                        continue
+                    try:
+                        addr = int(line[3:7], 16)
+                        rtype = int(line[7:9], 16)
+                    except ValueError:
+                        continue
+                    if rtype == 0 and (min_addr is None or addr < min_addr):
+                        min_addr = addr
+            return min_addr
+        except OSError:
+            return None
+
+    # ── LST parsing (hand-written asm modules with no C$/A$ debug records) ─────
+    #
+    # Modules assembled directly by sdasz80 without going through SDCC's C
+    # front-end (e.g. a project's own .s files calling into a C-compiled
+    # codebase) never get C$/A$ line records anywhere -- not in the .map,
+    # not in the .cdb, not even in their own per-module .sym file. Every PC
+    # inside them is an address_to_source miss. But if the project builds
+    # with sdasz80's `-l` listing flag, each module's .lst file has an exact
+    # relative-address -> source-line mapping (see parse_lst), which
+    # combined with that module's linked base address (from the .map) gives
+    # a fully precise addr -> (file, line) mapping -- no guessing needed.
+
+    _LST_PREFIX_WIDTH = 40  # sdasz80 listing: fixed-width addr/bytes/line prefix, then source text
+
+    def parse_map_module_info(self, map_path):
+        """Parse a linker .map file's "Files Linked" table into each linked
+        object's own base address, in link order.
+
+        "Files Linked" has rows `<obj path>.rel  [ <module> ]`, in the exact
+        order sdld placed each object's _CODE area -- the first one starts
+        at s__CODE, and every next one starts right after the previous
+        object's own _CODE area ends. Each object's _CODE size comes from
+        its own per-object .sym file's Area Table (`_CODE size B8`).
+
+        Deriving base addresses this way -- rather than from the minimum
+        address the global symbol table's "module" column attributes to a
+        module name -- matters because a module name isn't guaranteed
+        unique: this project has both wide_drawSolidBox.s and
+        wide_drawSpriteMasked.s declare `.module wide_sprites`, so the
+        symbol table's module column can't tell those two objects apart,
+        but their distinct positions in "Files Linked" still can.
+
+        Returns [{'module': str, 'obj_path': str, 'base_addr': int}, ...]
+        in link order.
+        """
+        entries = []
+        code_start = None
+        with open(map_path) as f:
+            for raw in f:
+                parts = raw.split()
+                if len(parts) == 4 and parts[0].endswith('.rel') and parts[1] == '[' and parts[3] == ']':
+                    entries.append((parts[2], parts[0]))
+                    continue
+                if len(parts) >= 2:
+                    try:
+                        addr = int(parts[0], 16)
+                    except ValueError:
+                        continue
+                    if parts[1] == 's__CODE' and code_start is None:
+                        code_start = addr
+
+        project_root = Path(map_path).resolve().parent.parent
+        base = code_start if code_start is not None else 0
+        result = []
+        for module, obj_path in entries:
+            result.append({'module': module, 'obj_path': obj_path, 'base_addr': base})
+            base += self._object_code_size(project_root / Path(obj_path).with_suffix('.sym'))
+        return result
+
+    @staticmethod
+    def _object_code_size(sym_path):
+        """Read one object's own _CODE area size from its .sym Area Table."""
+        try:
+            text = Path(sym_path).read_text()
+        except OSError:
+            return 0
+        match = re.search(r'_CODE\s+size\s+([0-9A-Fa-f]+)', text)
+        return int(match.group(1), 16) if match else 0
+
+    @classmethod
+    def parse_lst(cls, lst_path):
+        """Parse an sdasz80 listing file (built with -l) for the _CODE
+        area's relative-address -> source-line mapping.
+
+        Relative addressing restarts at 0 for every `.area` block in the
+        listing, so only the _CODE block is tracked -- mixing in another
+        area's addresses (_DATA, _INITIALIZER, ...) would silently produce
+        bogus entries indistinguishable from real _CODE ones. This only
+        matters for execution addresses anyway, and code doesn't run out of
+        those other areas.
+
+        Returns {relative_addr: line_num}, or {} if the file doesn't exist.
+        """
+        addr_to_line = {}
+        in_code_area = True  # sdasz80 defaults to _CODE until told otherwise
+        try:
+            with open(lst_path) as f:
+                for raw in f:
+                    line = raw.rstrip('\n')
+                    if len(line) < cls._LST_PREFIX_WIDTH:
+                        continue
+                    prefix = line[:cls._LST_PREFIX_WIDTH]
+                    text_tokens = line[cls._LST_PREFIX_WIDTH:].split()
+                    if text_tokens[:1] == ['.area']:
+                        in_code_area = len(text_tokens) > 1 and text_tokens[1] == '_CODE'
+                        continue
+                    addr_field = prefix[6:12].strip()
+                    line_field = prefix[34:40].strip()
+                    if not (in_code_area and addr_field and line_field.isdigit()):
+                        continue
+                    try:
+                        addr = int(addr_field, 16)
+                    except ValueError:
+                        continue
+                    # A label declaration and the instruction right after it
+                    # can share the same relative address (the label emits
+                    # no bytes of its own) -- keep the later (executable)
+                    # line for that address rather than the label line.
+                    addr_to_line[addr] = int(line_field)
+        except OSError:
+            pass
+        return addr_to_line
+
+    def _resolve_module_source(self, obj_path, project_root):
+        """Find the source file a linked object was assembled from.
+
+        Keyed by obj_path (unique per "Files Linked" row), not by the
+        `.module` name inside it -- see parse_map_module_info for why that
+        name can't be trusted to identify one object. Tries the project's
+        usual layout first: substitute the object tree's top-level
+        directory (e.g. "obj") for "src" in obj_path, keeping the rest of
+        the path, and probe common source extensions. Falls back to a
+        one-time recursive filename search under project_root for a file
+        whose stem matches the object's own filename stem, for projects
+        that don't mirror obj/ under src/.
+
+        Returns a full path string, or None if nothing matches.
+        """
+        if obj_path in self._module_source_cache:
+            return self._module_source_cache[obj_path]
+
+        rel = Path(obj_path)
+        result = None
+        if rel.parts:
+            mirrored = Path(project_root, 'src', *rel.parts[1:])
+            for ext in ('.s', '.asm', '.c'):
+                candidate = mirrored.with_suffix(ext)
+                if candidate.exists():
+                    result = str(candidate)
+                    break
+
+        if result is None:
+            if self._project_stem_index is None:
+                self._project_stem_index = {}
+                for path in Path(project_root).rglob('*'):
+                    if path.suffix in ('.s', '.asm', '.c') and path.stem not in self._project_stem_index:
+                        self._project_stem_index[path.stem] = str(path)
+            result = self._project_stem_index.get(rel.stem)
+
+        self._module_source_cache[obj_path] = result
+        return result
+
+    def build_asm_line_map(self, map_path):
+        """Augment address_to_source with exact lines from every linked
+        object's .lst listing (see parse_lst), for objects the .map/.cdb
+        gave no C$/A$ records for at all -- typically hand-written asm.
+
+        Returns {addr: (basename, line)}; also populates _path_cache for
+        every object's source file it manages to resolve.
+        """
+        extra = {}
+        project_root = Path(map_path).resolve().parent.parent
+        for info in self.parse_map_module_info(map_path):
+            lst_path = project_root / Path(info['obj_path']).with_suffix('.lst')
+            rel_lines = self.parse_lst(lst_path)
+            if not rel_lines:
+                continue
+            source_path = self._resolve_module_source(info['obj_path'], project_root)
+            if source_path is None:
+                continue
+            basename = Path(source_path).name
+            self._register_source_path(source_path)
+            for rel_addr, line_num in rel_lines.items():
+                extra[info['base_addr'] + rel_addr] = (basename, line_num)
+        return extra
 
     # ── CDB parsing (SDCC) ────────────────────────────────────────────────────
 
@@ -293,6 +610,35 @@ class DAPAdapter:
                     })
         return variables
 
+    def _global_variables(self):
+        """Build the DAP variables list for the Globals scope.
+
+        Sourced from self.globals (SLD 'L' records, see parse_sld). An
+        '+equ' entry shows the constant it was defined with -- reading
+        memory there would be meaningless (or, for something like
+        print_char/wait_char in the helloworld sample, would read ROM
+        firmware bytes miles away from anything this project owns).
+        Everything else is a real label: shown as its address plus,
+        whenever the emulator can read memory (read_memory_bytes is a
+        base-class stub returning None unless a subclass implements it),
+        the current byte stored there -- useful for a data label, and at
+        least shows the first opcode byte for a code label.
+        """
+        variables = []
+        for g in self.globals:
+            if g['equ']:
+                value = f"{g['address']:#06x}"
+            else:
+                data = self.read_memory_bytes(g['address'], 1)
+                value = f"{g['address']:#06x}" + (f' = {data[0]:#04x}' if data else '')
+            variables.append({
+                'name': g['name'],
+                'value': value,
+                'type': 'equ' if g['equ'] else 'label',
+                'variablesReference': 0,
+            })
+        return variables
+
     # ─────────────────────────────────────────────────────────────────────────
 
     def _register_source_path(self, full_path):
@@ -336,6 +682,8 @@ class DAPAdapter:
         if self.local_vars:
             scopes.append({'name': 'Locals', 'variablesReference': 2, 'expensive': False})
         scopes.append({'name': 'Registers', 'variablesReference': 1, 'expensive': False})
+        if self.globals:
+            scopes.append({'name': 'Globals', 'variablesReference': 3, 'expensive': False})
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -351,6 +699,14 @@ class DAPAdapter:
         if src:
             basename, line = src
             source_path = self._path_cache.get(basename, self._source_path)
+            self._last_frame = (source_path, line)
+        elif self._last_frame is not None:
+            # No debug info for this PC (e.g. a hand-written .s module
+            # assembled without line records) -- keep showing the last
+            # resolved location instead of snapping to whatever file
+            # _source_path happens to hold (typically unrelated), which
+            # otherwise makes the source window jump away on every step.
+            source_path, line = self._last_frame
         else:
             line        = 1
             source_path = self._source_path
@@ -382,6 +738,8 @@ class DAPAdapter:
         elif ref == 2:
             pc = regs.get('PC', self._load_address)
             variables = self._locals_for_pc(pc, regs)
+        elif ref == 3:
+            variables = self._global_variables()
         else:
             variables = []
         self.send({
@@ -410,6 +768,9 @@ class DAPAdapter:
         raise NotImplementedError
 
     def handle_write_memory(self, msg):
+        raise NotImplementedError
+
+    def handle_evaluate(self, msg):
         raise NotImplementedError
 
     def handle_step(self, msg):

@@ -3,16 +3,19 @@ local M = {}
 M.dapui_layout = {
   {
     elements = {
-      { id = "repl",        size = 0.05 },
-      { id = "scopes",      size = 0.20 },
-      { id = "breakpoints", size = 0.20 },
+      { id = "repl",        size = 0.15 },
+      { id = "scopes",      size = 0.35 },
+      { id = "breakpoints", size = 0.15 },
       { id = "stacks",      size = 0.20 },
       { id = "watches",     size = 0.15 },
-      { id = "expressions", size = 0.05 },
-      { id = "memory_dump", size = 0.15 },
     },
     size = 40,
     position = "left",
+  },
+  {
+    elements = { "memory_dump" },
+    size = 10,
+    position = "bottom",
   },
   {
     elements = { "build_log" },
@@ -26,7 +29,8 @@ M.ext_map = {
   s80       = "zesarux",
   c         = "zesarux",
   a         = "vice",
-  s         = "vice",
+  s         = "zesarux",  -- vice.py is an unimplemented stub; .s is Z80 asm
+                           -- in every sample this repo actually has today
   ["65s"]   = "vice",
   asm       = "zesarux",
 }
@@ -64,6 +68,15 @@ M.setup = function(opts)
     dap.listeners.after.event_stopped["nvim-dap-retro"] = function()
       dapui.open()
     end
+
+    vim.api.nvim_create_autocmd("VimResized", {
+      group = vim.api.nvim_create_augroup("nvim-dap-retro-resize", { clear = true }),
+      callback = function()
+        if dap.session() then
+          dapui.open({ reset = true })
+        end
+      end,
+    })
   end
   vim.notify("nvim-dap-retro loaded", vim.log.levels.INFO)
 end

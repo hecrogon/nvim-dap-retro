@@ -19,6 +19,7 @@ class ZesaruxAdapter(DAPAdapter):
     def __init__(self):
         super().__init__(LOG_FILE)
         self._load_address = 0x4000
+        self._load_address_explicit = False
         self._zesarux_host = ZESARUX_DEFAULT_HOST
         self._zesarux_port = ZESARUX_DEFAULT_PORT
         self._sock = None
@@ -117,6 +118,13 @@ class ZesaruxAdapter(DAPAdapter):
     def _monitor_breakpoint(self, reason):
         response = self.zesarux_recv_until_prompt()
         logging.debug(f'ZEsarUX stopped ({reason}): {response}')
+        # ZEsarUX pops its own native "Debug" window on every stop even with
+        # --disable-debug-console-win passed at launch (that flag alone did
+        # not stop it in practice) -- close it every time so it doesn't pile
+        # up/steal focus while something else (this adapter) is driving the
+        # session over ZRCP. Same command handle_launch already sends once
+        # at startup, just repeated on every stop instead of only then.
+        self.zesarux_send('close-all-menus')
         self.send({
             'type': 'event',
             'event': 'stopped',
@@ -147,6 +155,7 @@ class ZesaruxAdapter(DAPAdapter):
             self.cdb_file = Path(args['cdbFile'])
         if 'loadAddress' in args:
             self._load_address = int(str(args['loadAddress']), 0)
+            self._load_address_explicit = True
         logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} cdb_file={self.cdb_file} load_address=0x{self._load_address:04x}')
 
         if 'zesaruxArgs' in args:
@@ -200,17 +209,42 @@ class ZesaruxAdapter(DAPAdapter):
 
         if resolved_map is not None:
             self.sld_map, self.address_to_source, map_load_address = self.parse_map(resolved_map)
-            if map_load_address is not None:
-                self._load_address = map_load_address
-                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
         elif resolved_sld is not None:
             self.sld_map, self.address_to_source = self.parse_sld(resolved_sld)
+            map_load_address = None
+        else:
+            map_load_address = None
+
+        if not self._load_address_explicit:
+            # .ihx (if present) is authoritative -- it's what hex2bin itself
+            # uses, so it's correct even when the lowest area in the image is
+            # an (ABS) area sdld reports as address 0 everywhere in the .map.
+            ihx_load_address = self.parse_ihx_load_address(resolved_bin.with_suffix('.ihx'))
+            if ihx_load_address is not None:
+                self._load_address = ihx_load_address
+                logging.debug(f'Load address from .ihx: 0x{self._load_address:04x}')
+            elif map_load_address is not None:
+                self._load_address = map_load_address
+                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
 
         if self.cdb_file is not None:
             cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
             self.sld_map.update(cdb_lines)
             self.address_to_source.update(cdb_addrs)
             logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
+
+        if resolved_map is not None:
+            # Modules assembled directly (no C$/A$ records anywhere -- see
+            # build_asm_line_map) still get exact line info if built with
+            # sdasz80's -l listing flag. Existing C$/cdb entries win on
+            # overlap since they're never wrong; this only fills gaps.
+            asm_lines = self.build_asm_line_map(resolved_map)
+            added = 0
+            for addr, entry in asm_lines.items():
+                if addr not in self.address_to_source:
+                    self.address_to_source[addr] = entry
+                    added += 1
+            logging.debug(f'LST: filled {added} addr->line gaps from module listings')
 
         logging.debug(f'ZRCP >>> load-binary {resolved_bin} {self._load_address:x}h 0')
         self._sock.sendall(f'load-binary {resolved_bin} {self._load_address:x}h 0\n'.encode('ascii'))
@@ -313,10 +347,90 @@ class ZesaruxAdapter(DAPAdapter):
             'body': {'bytesWritten': len(data)},
         })
 
+    # ── Evaluate (debug console) ─────────────────────────────────────────────
+    #
+    # Exposes exact T-state (CPU cycle) timing via ZEsarUX's ZRCP counter --
+    # `reset-tstates-partial` / `get-tstates-partial` -- from the DAP debug
+    # console, plus a raw ZRCP passthrough for anything else. This replaces
+    # hand-rolled border-color screenshot timing (setting the border to a
+    # marker colour around a region of interest, capturing a frame, and
+    # measuring how many pixel rows it stayed that colour) with an exact
+    # cycle count: no screenshot, no display-geometry calibration to get
+    # wrong, and it works on code that never touches the border at all
+    # (interrupt handlers, anything off-screen). See nvim-dap-retro's README
+    # for the debug-console workflow this is meant to support:
+    #   1. breakpoint at the start of the region, continue, hit it
+    #   2. `tstates reset` in the debug console
+    #   3. breakpoint at the end (or `zrcp cpu-step-over` to skip one call),
+    #      continue
+    #   4. `tstates` in the debug console -- exact T-states and ms elapsed
+
+    def handle_evaluate(self, msg):
+        expr = msg['arguments'].get('expression', '').strip()
+        low = expr.lower()
+
+        if low in ('tstates reset', 'tstate reset', 'treset'):
+            self.zesarux_send('reset-tstates-partial')
+            result = 'T-state counter reset'
+        elif low in ('tstates', 'tstate'):
+            self._sock.sendall(b'get-tstates-partial\n')
+            result = self._format_tstates(self.zesarux_recv_until_prompt())
+        elif low.startswith('zrcp '):
+            result = self._zrcp_passthrough(expr[len('zrcp '):].strip())
+        else:
+            result = (f'Unknown expression: {expr!r} -- try "tstates", '
+                       f'"tstates reset", or "zrcp <command>"')
+
+        self.send({
+            'type': 'response',
+            'request_seq': msg['seq'],
+            'command': 'evaluate',
+            'success': True,
+            'body': {'result': result, 'variablesReference': 0},
+        })
+
+    @staticmethod
+    def _format_tstates(response):
+        if 'OVERFLOW' in response.upper():
+            return 'T-state counter overflowed -- reset it and measure a shorter region'
+        match = re.search(r'(\d+)', response)
+        if not match:
+            return f'(unparseable get-tstates-partial response: {response!r})'
+        t = int(match.group(1))
+        return f'{t} T-states = {t / 4:.1f} us ({t / 4000:.4f} ms @ 4MHz)'
+
+    def _zrcp_passthrough(self, raw_cmd):
+        """Send an arbitrary ZRCP command and return its raw response.
+
+        Bounded, unlike zesarux_recv_until_prompt: a command like `run` with
+        no breakpoint set never produces a prompt on its own, and the normal
+        unbounded wait would hang this handler -- and with it, every future
+        DAP request, since read_message()/handle() are not re-entrant.
+        """
+        logging.debug(f'ZRCP >>> {raw_cmd} (evaluate passthrough)')
+        self._sock.sendall(raw_cmd.encode('ascii') + b'\n')
+        self._sock.settimeout(5.0)
+        data = b''
+        try:
+            while b'command@' not in data and b'command>' not in data:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            data += b'\n(timed out after 5s waiting for a ZRCP prompt -- ' \
+                    b'this command may need a breakpoint to return, e.g. `run`)'
+        finally:
+            self._sock.settimeout(None)
+        response = data.decode('ascii', errors='replace').strip()
+        logging.debug(f'ZRCP <<< {response}')
+        return response
+
     def handle_step(self, msg):
         logging.debug('ZRCP >>> cpu-step')
         self._sock.sendall(b'cpu-step\n')
         self.zesarux_recv_until_prompt()
+        self.zesarux_send('close-all-menus')  # see _monitor_breakpoint
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
