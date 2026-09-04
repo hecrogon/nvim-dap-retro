@@ -86,6 +86,10 @@ class MameAdapter(DAPAdapter):
 
     # ── Memory helpers ────────────────────────────────────────────────────────
 
+    def read_memory_bytes(self, address, count):
+        """DAPAdapter hook used by the Locals/Globals scopes (base.py)."""
+        return self._read_memory_gdb(address, count)
+
     def _read_memory_gdb(self, address, count):
         resp = self.gdb_cmd(f'm{address:x},{count:x}')
         if resp.startswith('E') or not resp:

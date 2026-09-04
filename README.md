@@ -202,13 +202,76 @@ When nvim-dap-ui is present, a `memory_dump` element is registered and can be ad
 
 The panel displays a hex dump of `count` bytes starting at the load address, updated on every breakpoint stop. The address is read from `loadAddress` in the project's `launch.json` at runtime, falling back to the `load_address` value in `setup()` if not set. `count` is configured via `setup()` only.
 
+### Keymaps
+
+These apply only while the cursor is inside the memory dump buffer:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Scroll one line (16 bytes) down / up |
+| `<C-f>` / `<C-b>` | Scroll one page (`count` bytes) down / up |
+| `a` | Prompt for a hex address (e.g. `C000` or `0xC000`) and jump the view there |
+| `/` | Prompt for a hex byte sequence (e.g. `48656c6c6f` or `48 65 6c 6c 6f`) and jump to the first match — searches only the bytes currently loaded/displayed, not the full 64KB address space |
+| `e` | Edit the byte under the cursor (prompts for a hex value, writes it via `writeMemory`) |
+
+All of these are rebindable via `setup()`:
+
+```lua
+require("nvim-dap-retro").setup({
+  memory = {
+    keymaps = {
+      page_down       = "<C-f>",
+      page_up         = "<C-b>",
+      line_down       = "j",
+      line_up         = "k",
+      edit_byte       = "e",
+      jump_to_address = "a",
+      search_bytes    = "/",
+    },
+  },
+})
+```
+
+## Timing (T-states)
+
+The debug console (`:lua require('dap').repl.open()`, or nvim-dap-ui's REPL
+element) supports a few special expressions for exact-cycle timing via
+ZEsarUX's ZRCP T-state counter — no screenshots or display-geometry
+calibration involved, unlike border-colour timing tricks:
+
+| Expression | Effect |
+|------------|--------|
+| `tstates reset` | Resets ZEsarUX's T-state partial counter to 0 |
+| `tstates` | Reads the counter, formatted as both T-states and microseconds/milliseconds (at the target's clock speed) |
+| `zrcp <command>` | Sends `<command>` directly to ZRCP and returns its raw response — an escape hatch for anything not covered above (`get-registers`, `read-memory ...`, `cpu-step-over`, etc.) |
+
+Typical workflow for timing a region of code:
+
+1. Set a breakpoint at the start of the region, continue, let it hit.
+2. Type `tstates reset` in the debug console.
+3. Either set a second breakpoint at the end and continue, or type
+   `zrcp cpu-step-over` to run past a single `call` instruction.
+4. Type `tstates` — the result is the exact number of cycles the region
+   took.
+
+`get-tstates-partial` reports `OVERFLOW` once its counter wraps; if you see
+that in the result, reset and measure a shorter region.
+
 ## File extension mapping
 
 | Extension | Adapter |
 |-----------|---------|
 | `.z80`    | zesarux |
 | `.s80`    | zesarux |
+| `.c`      | zesarux |
+| `.s`      | zesarux |
 | `.asm`    | zesarux |
+| `.a`      | vice    |
+| `.65s`    | vice    |
+
+The `vice` adapter (`adapters/vice.py`) is currently an unimplemented stub —
+`.a`/`.65s` are mapped to it for when it lands, but nothing will actually
+launch yet if you use them.
 
 Custom mappings can be added via `opts.ext_map` in `setup()`.
 
