@@ -84,6 +84,21 @@ class MameAdapter(DAPAdapter):
         regs['PC'] = address
         self._write_registers(regs)
 
+    def write_register(self, name, value):
+        """GDB RSP has no single-register write for this stub's register
+        map (only `P n=val`, which needs the *index* into _REG_NAMES, not
+        a name) -- read-modify-write the whole block via `G` instead,
+        same as _set_pc already does. Only the 16-bit pairs in _REG_NAMES
+        (no 8-bit halves, no I/R -- MAME's Z80 gdbstub doesn't expose them
+        this way) are writable; anything else is reported as a failure.
+        """
+        if name not in _REG_NAMES:
+            return False
+        regs = self.read_registers()
+        regs[name] = value
+        self._write_registers(regs)
+        return True
+
     # ── Memory helpers ────────────────────────────────────────────────────────
 
     def read_memory_bytes(self, address, count):

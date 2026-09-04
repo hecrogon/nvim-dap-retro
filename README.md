@@ -101,7 +101,7 @@ The adapter can launch and close ZEsarUX automatically. Add a `zesaruxArgs` fiel
 "zesaruxArgs": ["--machine", "cpc6128", "--snap-no-change-machine"]
 ```
 
-ZEsarUX will be started when the debug session begins and terminated when it ends.
+ZEsarUX will be started when the debug session begins and terminated when it ends. Each session launched this way gets its own dedicated ZEsarUX process on its own auto-picked port (set `zesaruxPort` explicitly to override this and pin it to a fixed port instead) — so debugging two projects at once, or accidentally starting a second session before closing the first, doesn't reset or corrupt an already-running one.
 
 If you prefer to manage ZEsarUX yourself, omit `zesaruxArgs` and start it manually before debugging:
 
@@ -117,7 +117,7 @@ zesarux --noconfigfile --machine cpc6128 --snap-no-change-machine --enable-remot
 | `--disable-autoframeskip` | Render every video frame — required for screen updates to appear during ZRCP execution |
 | `--enable-remoteprotocol` | Enable ZRCP on port 10000 (required) |
 
-The adapter connects to `localhost:10000`.
+The adapter connects to `localhost:10000` in this manually-managed case. Note this is a single shared ZEsarUX process — unlike the auto-launched case above, a second concurrent session attaching here can still corrupt the first (see the "Multiple concurrent sessions" item in [TODO.md](TODO.md)).
 
 ## Project configuration
 
@@ -149,7 +149,7 @@ The plugin looks for debug configuration in `.debug/launch.json`. Example:
 | `zesaruxArgs` | Extra flags passed to ZEsarUX. When present, the adapter launches ZEsarUX automatically. `--noconfigfile` and `--enable-remoteprotocol` are always prepended. |
 | `zesaruxPath` | Path to the ZEsarUX binary. Defaults to `zesarux` (assumed to be in `$PATH`). |
 | `zesaruxHost` | Host where ZEsarUX is running. Defaults to `localhost`. |
-| `zesaruxPort` | ZRCP port. Defaults to `10000`. |
+| `zesaruxPort` | ZRCP port. If omitted (the default) *and* `zesaruxArgs` is set, the adapter picks a free port itself and launches its own dedicated ZEsarUX instance there — each debug session gets an isolated emulator process, so concurrent sessions don't corrupt each other. Set this explicitly to attach to a specific (possibly shared) instance instead, e.g. one you started manually — see below. |
 | `preLaunchTask` | Label of a task in `tasks.json` to run before launching. |
 
 **.debug/tasks.json**
@@ -214,6 +214,8 @@ These apply only while the cursor is inside the memory dump buffer:
 | `/` | Prompt for a hex byte sequence (e.g. `48656c6c6f` or `48 65 6c 6c 6f`) and jump to the first match — searches only the bytes currently loaded/displayed, not the full 64KB address space |
 | `e` | Edit the byte under the cursor (prompts for a hex value, writes it via `writeMemory`) |
 
+> **Editing a screen-RAM byte and not seeing it change on the emulator?** The write did happen — ZEsarUX only repaints its display while the CPU is actually executing frames, so a raw memory poke while halted at a breakpoint doesn't trigger a redraw on its own. Step or continue once and the change will appear.
+
 All of these are rebindable via `setup()`:
 
 ```lua
@@ -266,12 +268,6 @@ that in the result, reset and measure a shorter region.
 | `.c`      | zesarux |
 | `.s`      | zesarux |
 | `.asm`    | zesarux |
-| `.a`      | vice    |
-| `.65s`    | vice    |
-
-The `vice` adapter (`adapters/vice.py`) is currently an unimplemented stub —
-`.a`/`.65s` are mapped to it for when it lands, but nothing will actually
-launch yet if you use them.
 
 Custom mappings can be added via `opts.ext_map` in `setup()`.
 
@@ -282,6 +278,7 @@ The `samples/` directory contains ready-to-debug projects:
 | Sample | Target | Description |
 |--------|--------|-------------|
 | `amstrad/helloworld` | Amstrad CPC 6128 | Prints `HELLO` and draws pixels |
+| `spectrum/helloworld` | ZX Spectrum 48K | Prints `HELLO` |
 
 Each sample includes the Z80 source and a `.debug/` configuration. Bring your own build system — the samples use `sjasmplus` but any assembler that produces a `.bin` + `.sld` pair will work.
 

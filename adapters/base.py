@@ -39,6 +39,7 @@ class DAPAdapter:
             'stackTrace':        self.handle_stack_trace,
             'scopes':            self.handle_scopes,
             'variables':         self.handle_variables,
+            'setVariable':       self.handle_set_variable,
             'readMemory':        self.handle_read_memory,
             'writeMemory':       self.handle_write_memory,
             'evaluate':          self.handle_evaluate,
@@ -556,6 +557,18 @@ class DAPAdapter:
         """Read raw bytes from emulator memory. Subclasses override to support stack locals."""
         return None
 
+    def extra_scopes(self):
+        """Additional DAP scopes beyond Locals/Registers/Globals. Subclasses
+        override to contribute emulator-specific ones (e.g. ZesaruxAdapter's
+        CRTC registers) -- kept out of the base class so it stays agnostic
+        about what hardware a given adapter is actually talking to."""
+        return []
+
+    def extra_scope_variables(self, ref):
+        """variablesReference values not handled above (1/2/3) land here.
+        Subclasses override alongside extra_scopes() to supply their content."""
+        return []
+
     @staticmethod
     def _resolve_sdcc_reg(reg_name, regs):
         """Map an SDCC register name (e.g. 'l', 'bc') to its value from the regs dict.
@@ -664,6 +677,7 @@ class DAPAdapter:
                 'supportsConfigurationDoneRequest': True,
                 'supportsReadMemoryRequest': True,
                 'supportsWriteMemoryRequest': True,
+                'supportsSetVariable': True,
             },
         })
         self.send({'type': 'event', 'event': 'initialized'})
@@ -684,6 +698,7 @@ class DAPAdapter:
         scopes.append({'name': 'Registers', 'variablesReference': 1, 'expensive': False})
         if self.globals:
             scopes.append({'name': 'Globals', 'variablesReference': 3, 'expensive': False})
+        scopes.extend(self.extra_scopes())
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -741,7 +756,7 @@ class DAPAdapter:
         elif ref == 3:
             variables = self._global_variables()
         else:
-            variables = []
+            variables = self.extra_scope_variables(ref)
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -750,9 +765,100 @@ class DAPAdapter:
             'body': {'variables': variables},
         })
 
+    @staticmethod
+    def _hex_candidate(segment):
+        """Strip an optional leading '> ' prompt marker and '0x' prefix,
+        then parse as hex. Returns None if the segment isn't valid hex."""
+        s = segment.strip()
+        if s.startswith('> '):
+            s = s[2:].strip()
+        if s[:2].lower() == '0x':
+            s = s[2:]
+        try:
+            return int(s, 16) & 0xFFFF
+        except ValueError:
+            return None
+
+    def _parse_register_edit(self, raw_value, name):
+        """Parse a setVariable value for the Registers scope into an int,
+        or None if nothing usable could be recovered.
+
+        dapui's Scopes "edit" prompt is inline in the tree buffer, prefilled
+        with the register's current value. On at least some setups the
+        submitted value ends up as that old value AND the freshly typed one
+        concatenated with a literal "> " prompt marker in between (order
+        not reliable either way -- confirmed both "old\\n> new" and
+        "new\\n> old" happening in practice), e.g. "0x8130\\n> 0x8114"
+        instead of just "0x8130". Rather than guess a fixed position,
+        parse every line as a candidate and, when there's more than one,
+        drop whichever one matches the register's actual current value --
+        that's the stale prefill, not what was typed. If that leaves more
+        than one candidate standing (or the current value can't be read),
+        fall back to the last one, since that's closest to "most recently
+        typed" in every observed case.
+        """
+        segments = [seg for seg in raw_value.splitlines() if seg.strip()] or [raw_value]
+        candidates = [(seg, self._hex_candidate(seg)) for seg in segments]
+        candidates = [(seg, v) for seg, v in candidates if v is not None]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][1]
+
+        current = self.read_registers().get(name)
+        if current is not None:
+            filtered = [(seg, v) for seg, v in candidates if v != (current & 0xFFFF)]
+            if filtered:
+                candidates = filtered
+        return candidates[-1][1]
+
+    def handle_set_variable(self, msg):
+        """Only the Registers scope (ref 1) is editable -- Locals/Globals/
+        CRTC/etc. are all derived read-only views (symbol tables, memory
+        peeks), there's no single emulator write that would make sense for
+        "set this local's value" the way there is for a real register.
+        """
+        args      = msg['arguments']
+        ref       = args.get('variablesReference')
+        name      = args.get('name')
+        raw_value = args.get('value', '').strip()
+
+        if ref != 1:
+            self.send({
+                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
+                'success': False, 'message': 'Only the Registers scope supports editing',
+            })
+            return
+
+        value = self._parse_register_edit(raw_value, name)
+        if value is None:
+            self.send({
+                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
+                'success': False, 'message': f'Invalid hex value: {raw_value!r}',
+            })
+            return
+
+        if self.write_register(name, value):
+            self.send({
+                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
+                'success': True,
+                'body': {'value': f'0x{value:04x}', 'variablesReference': 0},
+            })
+        else:
+            self.send({
+                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
+                'success': False, 'message': f'Emulator rejected writing register {name!r}',
+            })
+
     # ── Abstract interface ────────────────────────────────────────────────────
 
     def read_registers(self) -> dict:
+        raise NotImplementedError
+
+    def write_register(self, name: str, value: int) -> bool:
+        """Write a single register. Return True on success. Subclasses
+        override; see zesarux.py (ZRCP `set-register`) and mame.py (GDB RSP
+        `G` write-all-registers, reusing _write_registers)."""
         raise NotImplementedError
 
     def handle_launch(self, msg):
