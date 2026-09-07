@@ -6,12 +6,15 @@ import time
 import threading
 import re
 import base64
+
 from pathlib import Path
 
 from base import DAPAdapter
 
 ZESARUX_DEFAULT_HOST = 'localhost'
 ZESARUX_DEFAULT_PORT = 10000
+ZESARUX_RECV_TIMEOUT = 15.0
+
 LOG_FILE = '/tmp/zesarux-dap.log'
 
 
@@ -26,6 +29,7 @@ class ZesaruxAdapter(DAPAdapter):
         self._process = None
         self._setup_done = False
         self._machine_name = ''
+        self._io_port_sections = {}  # {variablesReference: [child vars]}, see extra_scope_variables
         self._active_breakpoints = set()
         self._stop_on_exit = True
         self.map_file = None
@@ -73,8 +77,10 @@ class ZesaruxAdapter(DAPAdapter):
         it's what handle_launch is about to connect self._sock to.
         """
         zesarux_bin = args.get('zesaruxPath', 'zesarux')
-        launch_cmd = [zesarux_bin, '--noconfigfile', '--enable-remoteprotocol'] + args['zesaruxArgs'] \
-            + ['--remoteprotocol-port', str(self._zesarux_port)]
+        launch_cmd = [
+            zesarux_bin, '--noconfigfile', '--enable-remoteprotocol',
+            '--disable-debug-console-win', '--disable-all-first-aid', '--disable-restore-windows',
+        ] + args['zesaruxArgs'] + ['--remoteprotocol-port', str(self._zesarux_port)]
         logging.debug(f'Launching ZEsarUX: {launch_cmd}')
         self._process = subprocess.Popen(launch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._wait_for_zesarux()
@@ -97,14 +103,38 @@ class ZesaruxAdapter(DAPAdapter):
         logging.debug(f'ZRCP <<< {response}')
         return response
 
-    def zesarux_recv_until_prompt(self):
-        """Block until ZEsarUX sends a command prompt (command@ or command>)."""
+    def zesarux_recv_until_prompt(self, timeout=ZESARUX_RECV_TIMEOUT):
+        """Block until ZEsarUX sends a command prompt (command@ or command>).
+
+        Bounded by `timeout` (seconds), except when a caller explicitly
+        passes None -- used only by the continue/run monitor thread, where
+        blocking for as long as the debuggee actually runs before hitting
+        a breakpoint (which could legitimately be minutes, e.g. waiting on
+        a keypress) is the whole point. Every other caller wants a fast,
+        real ZRCP round-trip; if the connection is dead or ZEsarUX has
+        stalled, hitting this bound raises rather than hanging this
+        process forever with no feedback -- turning that into a prompt,
+        visible crash that nvim-dap's own adapter-exit notification
+        already surfaces well (":DapShowLog" pointer + a stderr log with
+        this exception's message and traceback).
+        """
         data = b''
-        while b'command@' not in data and b'command>' not in data:
-            chunk = self._sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
+        if timeout is not None:
+            self._sock.settimeout(timeout)
+        try:
+            while b'command@' not in data and b'command>' not in data:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            raise RuntimeError(
+                f'ZEsarUX did not respond within {timeout}s -- it may have '
+                'crashed, been closed, or the connection stalled'
+            ) from None
+        finally:
+            if timeout is not None:
+                self._sock.settimeout(None)
         response = data.decode('ascii').strip()
         logging.debug(f'ZRCP <<< {response}')
         return response
@@ -155,12 +185,60 @@ class ZesaruxAdapter(DAPAdapter):
         except (ValueError, IndexError):
             return None
 
+    def close_all_menus(self):
+        """close-all-menus can take longer than zesarux_send's 0.1s budget
+        to reply -- e.g. dismissing ZEsarUX's native Debug popup, which is
+        conspicuously slow the first time it's shown. Read reliably here so
+        a late reply can't sit unread in the socket and get consumed by
+        whatever ZRCP command runs next (observed corrupting both a
+        following read-memory call and, via _monitor_breakpoint, a
+        following get-registers call).
+        """
+        self._sock.sendall(b'close-all-menus\n')
+        self.zesarux_recv_until_prompt()
+
+    def enter_cpu_step(self):
+        """enter-cpu-step can take ZEsarUX itself up to ~3s internally
+        (it waits out any menu still closing, then waits for its own
+        acknowledgement) -- far past zesarux_send's 0.1s budget, so a
+        plain zesarux_send here just returns empty and leaves the real,
+        delayed reply (often "Error. Can not enter cpu step mode. You can
+        try closing the menu") to be misread by whatever command happens
+        to call zesarux_recv_until_prompt next.
+
+        A stuck menu left over from a previous session's ZEsarUX process
+        (e.g. one this adapter attached to instead of spawning fresh) is
+        the usual cause of that error; one extra close-all-menus + retry
+        clears it. If it still won't take, raise rather than silently
+        report launch success -- the debuggee would never actually run
+        (continue/run all require this mode) and the eventual failure is
+        much harder to diagnose than a clear error at launch time.
+        """
+        self._sock.sendall(b'enter-cpu-step\n')
+        response = self.zesarux_recv_until_prompt()
+        if 'error' in response.lower():
+            logging.debug(f'enter-cpu-step failed ({response!r}) -- retrying after close-all-menus')
+            self.close_all_menus()
+            self._sock.sendall(b'enter-cpu-step\n')
+            response = self.zesarux_recv_until_prompt()
+        if 'error' in response.lower():
+            raise RuntimeError(
+                f'ZEsarUX would not enter cpu-step mode ({response!r}) -- it likely '
+                'has a stuck menu/dialog open from a previous session. Close that '
+                'ZEsarUX window (or kill the process) and relaunch the debug session'
+            )
+
     # ── Stop monitor ──────────────────────────────────────────────────────────
 
     def _monitor_breakpoint(self, reason):
-        response = self.zesarux_recv_until_prompt()
+        response = self.zesarux_recv_until_prompt(timeout=None)
         logging.debug(f'ZEsarUX stopped ({reason}): {response}')
-        self.zesarux_send('close-all-menus')
+        if 'must first enter cpu-step mode' in response:
+            logging.debug('run rejected -- ZEsarUX left cpu-step mode; reporting program exit')
+            self.send({'type': 'event', 'event': 'exited', 'body': {'exitCode': 0}})
+            self.send({'type': 'event', 'event': 'terminated'})
+            return
+
         self.send({
             'type': 'event',
             'event': 'stopped',
@@ -196,41 +274,30 @@ class ZesaruxAdapter(DAPAdapter):
 
         if 'zesaruxArgs' in args:
             if 'zesaruxPort' in args:
-                # Explicit port -- the user wants this specific instance
-                # (possibly one they're sharing across sessions on purpose).
-                # Preserve the original attach-if-already-running behavior.
                 if self._is_running():
                     logging.debug('ZEsarUX already running, skipping launch')
                 else:
                     self._launch_zesarux(args)
             else:
-                # No port requested -- launch our own dedicated instance on
-                # a freshly picked free port instead of the shared default
-                # 10000. A second concurrent debug() call (a different
-                # buffer, a session left dangling) would otherwise silently
-                # corrupt this one: hard-reset-cpu resets the machine and
-                # clear-membreakpoints wipes breakpoints out from under
-                # whichever session got there first, since ZEsarUX has no
-                # concept of "sessions" -- one process is one shared Z80
-                # core no matter how many ZRCP clients connect to it. Two
-                # separate processes on two separate ports have nothing to
-                # collide over.
                 self._zesarux_port = self._find_free_port()
                 self._launch_zesarux(args)
 
         self._sock = socket.create_connection((self._zesarux_host, self._zesarux_port))
-        logging.debug('Connected to ZEsarUX')
+        logging.info(
+            f'Connected to ZEsarUX ZRCP at {self._zesarux_host}:{self._zesarux_port} '
+            f'-- telnet {self._zesarux_host} {self._zesarux_port} to poke it manually'
+        )
+
         self.zesarux_recv()  # drain welcome banner
-        # zesarux_send's reply includes the trailing ZRCP prompt (e.g.
-        # "ZX Spectrum 48k\ncommand>") -- only the first line is the answer.
         self._machine_name = self.zesarux_send('get-current-machine').splitlines()[0].strip().lower()
         logging.debug(f'ZEsarUX machine: {self._machine_name!r}')
-        self.zesarux_send('close-all-menus')
+
+        self.close_all_menus()
         self.zesarux_send('hard-reset-cpu')
-        self.zesarux_send('enter-cpu-step')
+        self.enter_cpu_step()
         self.zesarux_send('set-debug-settings 0')
         self.zesarux_send('clear-membreakpoints')
-        # Pre-clear all 100 breakpoint slots — send in bulk then drain once
+
         bulk = ''.join(f'disable-breakpoint {i}\n' for i in range(1, 101))
         logging.debug('ZRCP >>> disable-breakpoint 1..100 (bulk)')
         self._sock.sendall(bulk.encode('ascii'))
@@ -288,10 +355,6 @@ class ZesaruxAdapter(DAPAdapter):
             logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
 
         if resolved_map is not None:
-            # Modules assembled directly (no C$/A$ records anywhere -- see
-            # build_asm_line_map) still get exact line info if built with
-            # sdasz80's -l listing flag. Existing C$/cdb entries win on
-            # overlap since they're never wrong; this only fills gaps.
             asm_lines = self.build_asm_line_map(resolved_map)
             added = 0
             for addr, entry in asm_lines.items():
@@ -346,6 +409,8 @@ class ZesaruxAdapter(DAPAdapter):
         self._load_binary(getattr(self, '_source_path', None))
         entry = next((start for name, start, end in self.functions if name == 'main'), self._load_address)
         self.zesarux_send(f'set-register PC={entry:x}h')
+        # See _monitor_breakpoint: no close_all_menus() here -- it drops
+        # cpu-step mode as a side effect and can permanently wedge ZEsarUX.
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -402,22 +467,6 @@ class ZesaruxAdapter(DAPAdapter):
         })
 
     # ── Evaluate (debug console) ─────────────────────────────────────────────
-    #
-    # Exposes exact T-state (CPU cycle) timing via ZEsarUX's ZRCP counter --
-    # `reset-tstates-partial` / `get-tstates-partial` -- from the DAP debug
-    # console, plus a raw ZRCP passthrough for anything else. This replaces
-    # hand-rolled border-color screenshot timing (setting the border to a
-    # marker colour around a region of interest, capturing a frame, and
-    # measuring how many pixel rows it stayed that colour) with an exact
-    # cycle count: no screenshot, no display-geometry calibration to get
-    # wrong, and it works on code that never touches the border at all
-    # (interrupt handlers, anything off-screen). See nvim-dap-retro's README
-    # for the debug-console workflow this is meant to support:
-    #   1. breakpoint at the start of the region, continue, hit it
-    #   2. `tstates reset` in the debug console
-    #   3. breakpoint at the end (or `zrcp cpu-step-over` to skip one call),
-    #      continue
-    #   4. `tstates` in the debug console -- exact T-states and ms elapsed
 
     def handle_evaluate(self, msg):
         expr = msg['arguments'].get('expression', '').strip()
@@ -480,75 +529,104 @@ class ZesaruxAdapter(DAPAdapter):
         logging.debug(f'ZRCP <<< {response}')
         return response
 
-    # ── CRTC registers scope ─────────────────────────────────────────────────
-    #
-    # ZRCP has no dedicated "get CRTC registers" command -- they're one
-    # section of the much broader `get-io-ports` dump (floppy controller,
-    # PPI, Gate Array, AY-3-8912 sound chip, ...), verified live against a
-    # real ZEsarUX instance. Exposed as its own DAP scope (alongside
-    # Registers/Locals/Globals from base.py) rather than requiring
-    # `zrcp get-io-ports` in the debug console every time.
+    # ── I/O ports scope ───────────────────────────────────────────────────────
 
-    _CRTC_SCOPE_REF = 4
+    _IO_PORTS_SCOPE_REF = 4
+    _IO_PORTS_SECTION_REF_BASE = 1000
 
     def extra_scopes(self):
-        # Only CPC targets actually have a CRTC chip -- 'get-current-machine'
-        # is queried once at launch (see handle_launch) and cached, so this
-        # doesn't cost a round-trip on every scopes request. Without this
-        # check every other ZEsarUX target (Spectrum, etc.) would show an
-        # always-empty "CRTC" scope, which is just noise.
-        if 'cpc' not in self._machine_name:
-            return []
-        return [{'name': 'CRTC', 'variablesReference': self._CRTC_SCOPE_REF, 'expensive': False}]
+        return [{'name': 'I/O Ports', 'variablesReference': self._IO_PORTS_SCOPE_REF, 'expensive': False}]
 
     def extra_scope_variables(self, ref):
-        if ref == self._CRTC_SCOPE_REF:
+        if ref == self._IO_PORTS_SCOPE_REF:
             self._sock.sendall(b'get-io-ports\n')
-            return self._parse_crtc_registers(self.zesarux_recv_until_prompt())
-        return []
+            top_level, sections = self._parse_io_ports(self.zesarux_recv_until_prompt())
+            self._io_port_sections = {}
+            variables = list(top_level)
+            for i, (name, children) in enumerate(sections.items()):
+                section_ref = self._IO_PORTS_SECTION_REF_BASE + i
+                self._io_port_sections[section_ref] = children
+                variables.append({
+                    'name': name,
+                    'value': f'{len(children)} entries',
+                    'type': 'io-port-section',
+                    'variablesReference': section_ref,
+                })
+            return variables
+        return self._io_port_sections.get(ref, [])
 
     @staticmethod
-    def _parse_crtc_registers(response):
-        """Pull just the "CRTC Registers:" block out of a get-io-ports
-        response:
-            CRTC Registers:
-            00:  3F
-            01:  28
-            ...
-            1F:  00
+    def _parse_io_ports(response):
+        """Parse a get-io-ports response into (top_level, sections) for a
+        grouped/expandable DAP variables tree, generically.
 
-            PPI Port A:  00
-            ...
-        Stops at the first blank line (or anything that doesn't match a
-        register line) after the header. Returns [] on a non-CPC/PCW
-        machine, where get-io-ports has no CRTC section at all -- the
-        scope just shows empty rather than erroring.
+        Three line shapes, recognized purely by structure (no section names
+        hardcoded):
+          - "Some Section:"      (colon, nothing after it) -- a section
+            header, e.g. "CRTC Registers:", "PD765 status:", "AY-3-8912
+            chip 0:". Opens a new group in `sections`; doesn't emit a
+            variable itself (it becomes the group's own tree node, built
+            by the caller with a variablesReference pointing at its
+            children).
+          - "NN: NN"             (2 hex digits, colon, 2 hex digits) -- one
+            entry of an indexed register table, nested under the current
+            section's group (or top-level if none is open), e.g. CRTC/Gate
+            Array/AY-3-8912's "00:  3F" rows. Named bare "RNN" -- safe to
+            drop the section-name prefix a flatter representation would
+            have needed, since each table is now its own group and every
+            table restarts at 00 regardless.
+          - "Some Key: value"    (colon, something after it) -- a plain
+            field, e.g. "ULA Data Bus value: FFH", "PPI Port A:  00",
+            "Motor: Off". Nested under the current section the same way.
+        Anything else (blank lines, decorative continuation lines like
+        "(RQM    )" with no colon at all) is skipped.
+
+        Returns (top_level_vars, {section_name: [child_vars]}), both in
+        the order they first appeared.
         """
-        variables = []
-        in_block = False
-        for line in response.splitlines():
-            if line.strip() == 'CRTC Registers:':
-                in_block = True
+        top_level = []
+        sections = {}
+        section = None
+        saw_register_in_section = False
+
+        for raw in response.splitlines():
+            line = raw.strip()
+            if not line:
                 continue
-            if not in_block:
+
+            reg_match = re.match(r'^([0-9A-Fa-f]{2}):\s+(\S+)$', line)
+            if reg_match and re.fullmatch(r'[0-9A-Fa-f]{1,2}', reg_match.group(2)):
+                reg_num, value = reg_match.groups()
+                target = sections[section] if section else top_level
+                target.append({
+                    'name': f'R{reg_num}', 'value': f'0x{value}', 'type': 'register', 'variablesReference': 0,
+                })
+                saw_register_in_section = True
                 continue
-            match = re.match(r'^([0-9A-Fa-f]{2}):\s+([0-9A-Fa-f]{2})$', line.strip())
-            if not match:
-                break
-            reg_num, value = match.groups()
-            variables.append({
-                'name': f'R{reg_num}',
-                'value': f'0x{value}',
-                'type': 'register',
-                'variablesReference': 0,
-            })
-        return variables
+
+            if line.endswith(':'):
+                section = line[:-1].strip()
+                sections[section] = []
+                saw_register_in_section = False
+                continue
+
+            if ':' in line:
+                if saw_register_in_section:
+                    section = None
+                    saw_register_in_section = False
+                key, _, value = line.partition(':')
+                key, value = key.strip(), value.strip()
+                target = sections[section] if section else top_level
+                target.append({
+                    'name': key, 'value': value, 'type': 'io-port', 'variablesReference': 0,
+                })
+        return top_level, sections
 
     def handle_step(self, msg):
         logging.debug('ZRCP >>> cpu-step')
         self._sock.sendall(b'cpu-step\n')
         self.zesarux_recv_until_prompt()
-        self.zesarux_send('close-all-menus')  # see _monitor_breakpoint
+        # See _monitor_breakpoint -- no close_all_menus() here.
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -572,6 +650,19 @@ class ZesaruxAdapter(DAPAdapter):
             'body': {'allThreadsContinued': True},
         })
 
+    def _terminate_spawned_process(self):
+        """Kill the ZEsarUX process this adapter launched, if any. Shared by
+        the normal handle_disconnect path and cleanup_on_crash (see base.py)
+        -- a crash must not leave a spawned emulator process orphaned just
+        because it skipped the normal disconnect sequence.
+        """
+        if self._process and self._stop_on_exit:
+            logging.debug(f'Terminating spawned ZEsarUX process (pid {self._process.pid})')
+            self._process.terminate()
+
+    def cleanup_on_crash(self):
+        self._terminate_spawned_process()
+
     def handle_disconnect(self, msg):
         if self._sock:
             for i in self._active_breakpoints:
@@ -580,8 +671,7 @@ class ZesaruxAdapter(DAPAdapter):
             self.zesarux_send('disable-breakpoints')
             self.zesarux_send('exit-cpu-step')
             self._sock.close()
-        if self._process and self._stop_on_exit:
-            self._process.terminate()
+        self._terminate_spawned_process()
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],

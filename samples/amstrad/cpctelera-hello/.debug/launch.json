@@ -6,6 +6,7 @@
       "name": "Debug (CPCTelera/SDCC)",
       "program": "${workspaceFolder}/obj/hello.bin",
       "mapFile": "${workspaceFolder}/obj/hello.map",
+      "zesaruxPort": 10000,
       "zesaruxArgs": ["--machine", "cpc6128"],
       "preLaunchTask": "build"
     }
