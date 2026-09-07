@@ -282,16 +282,6 @@ class DAPAdapter:
             return None
 
     # ── LST parsing (hand-written asm modules with no C$/A$ debug records) ─────
-    #
-    # Modules assembled directly by sdasz80 without going through SDCC's C
-    # front-end (e.g. a project's own .s files calling into a C-compiled
-    # codebase) never get C$/A$ line records anywhere -- not in the .map,
-    # not in the .cdb, not even in their own per-module .sym file. Every PC
-    # inside them is an address_to_source miss. But if the project builds
-    # with sdasz80's `-l` listing flag, each module's .lst file has an exact
-    # relative-address -> source-line mapping (see parse_lst), which
-    # combined with that module's linked base address (from the .map) gives
-    # a fully precise addr -> (file, line) mapping -- no guessing needed.
 
     _LST_PREFIX_WIDTH = 40  # sdasz80 listing: fixed-width addr/bytes/line prefix, then source text
 
@@ -716,11 +706,7 @@ class DAPAdapter:
             source_path = self._path_cache.get(basename, self._source_path)
             self._last_frame = (source_path, line)
         elif self._last_frame is not None:
-            # No debug info for this PC (e.g. a hand-written .s module
-            # assembled without line records) -- keep showing the last
-            # resolved location instead of snapping to whatever file
-            # _source_path happens to hold (typically unrelated), which
-            # otherwise makes the source window jump away on every step.
+            # No debug info for this PC
             source_path, line = self._last_frame
         else:
             line        = 1
@@ -898,6 +884,16 @@ class DAPAdapter:
         else:
             logging.warning(f'Unknown command: {cmd}')
 
+    def cleanup_on_crash(self):
+        """Best-effort cleanup when main()'s loop dies from an unhandled
+        exception -- normally handle_disconnect is what tears things down
+        (including killing an emulator process this adapter spawned), but
+        a crash skips straight past that, which would otherwise orphan the
+        emulator process silently forever. Subclasses override; no-op by
+        default since the base class has no process of its own to clean up.
+        """
+        pass
+
     def main(self):
         while True:
             try:
@@ -905,4 +901,8 @@ class DAPAdapter:
                 self.handle(msg)
             except Exception:
                 logging.exception('Unhandled exception')
+                try:
+                    self.cleanup_on_crash()
+                except Exception:
+                    logging.exception('cleanup_on_crash itself failed')
                 raise

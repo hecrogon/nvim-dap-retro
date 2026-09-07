@@ -281,6 +281,21 @@ class MameAdapter(DAPAdapter):
             'body': {'allThreadsContinued': True},
         })
 
+    def _terminate_spawned_process(self):
+        """Kill the MAME process this adapter launched, if any. Shared by
+        the normal handle_disconnect path and cleanup_on_crash (see
+        base.py) -- a crash must not leave a spawned MAME process orphaned
+        just because it skipped the normal disconnect sequence.
+        """
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+
+    def cleanup_on_crash(self):
+        self._terminate_spawned_process()
+
     def handle_disconnect(self, msg):
         if self._sock:
             try:
@@ -292,11 +307,7 @@ class MameAdapter(DAPAdapter):
                 self._sock.close()
             except Exception:
                 pass
-        if self._process:
-            try:
-                self._process.terminate()
-            except Exception:
-                pass
+        self._terminate_spawned_process()
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],

@@ -5,6 +5,7 @@
       "request": "launch",
       "name": "ZEsarUX Debug",
       "zesaruxPath": "zesarux",
+      "zesaruxPort": 10000,
       "zesaruxArgs": ["--machine", "cpc6128", "--snap-no-change-machine", "--disable-autoframeskip"],
       "program": "${workspaceFolder}/build/sprite.bin",
       "sldFile": "${workspaceFolder}/build/sprite.sld",

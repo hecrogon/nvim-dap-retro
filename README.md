@@ -149,7 +149,7 @@ The plugin looks for debug configuration in `.debug/launch.json`. Example:
 | `zesaruxArgs` | Extra flags passed to ZEsarUX. When present, the adapter launches ZEsarUX automatically. `--noconfigfile` and `--enable-remoteprotocol` are always prepended. |
 | `zesaruxPath` | Path to the ZEsarUX binary. Defaults to `zesarux` (assumed to be in `$PATH`). |
 | `zesaruxHost` | Host where ZEsarUX is running. Defaults to `localhost`. |
-| `zesaruxPort` | ZRCP port. If omitted (the default) *and* `zesaruxArgs` is set, the adapter picks a free port itself and launches its own dedicated ZEsarUX instance there — each debug session gets an isolated emulator process, so concurrent sessions don't corrupt each other. Set this explicitly to attach to a specific (possibly shared) instance instead, e.g. one you started manually — see below. |
+| `zesaruxPort` | ZRCP port. If omitted (the default) *and* `zesaruxArgs` is set, the adapter picks a free port itself and launches its own dedicated ZEsarUX instance there — each debug session gets an isolated emulator process, so concurrent sessions don't corrupt each other. Set this explicitly to attach to a specific (possibly shared) instance instead, e.g. one you started manually — see below. The actual port in use (whichever way it was picked) is always logged — see [Troubleshooting](#troubleshooting) — handy if you want to `telnet` in yourself and poke ZRCP by hand alongside the debug session. |
 | `preLaunchTask` | Label of a task in `tasks.json` to run before launching. |
 
 **.debug/tasks.json**

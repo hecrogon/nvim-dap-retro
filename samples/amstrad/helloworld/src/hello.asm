@@ -21,7 +21,7 @@ main:
     call print_char
 
     ld hl,0xc370
-    ld c,10d
+    ld c,11d
 pixel_loop:
     ld (hl),255
     inc hl
