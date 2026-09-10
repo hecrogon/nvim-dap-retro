@@ -80,32 +80,22 @@ class DAPAdapter:
 
         SLD record format (8 pipe-delimited fields):
             <source file>|<src line>|<def file>|<def line>|<page>|<value>|<type>|<data>
-        Only two types matter here: 'T' (instruction Trace -- one line of
-        real emitted code, the only type carrying a breakpointable
-        address) and 'L' (Label -- a code label or `equ`, see
-        _parse_sld_label). 'D'/'F' are older, now-redundant variants of
-        'L' the spec says to treat as 'L' as well, but sjasmplus already
-        emits a same-address 'L' line for everything 'D'/'F' would cover,
-        so there is nothing to gain from also parsing them. 'Z' (memory
-        model) and 'K' (keyword comment) carry no address/line data.
+        Only 'T' (instruction Trace, a breakpointable address) and 'L'
+        (Label -- a code label or `equ`, see _parse_sld_label) matter here.
+        'D'/'F' are redundant with 'L' (sjasmplus emits a same-address 'L'
+        line for everything they'd cover). 'Z'/'K' carry no address/line
+        data.
 
-        The filepath in field 0 is whatever path sjasmplus was invoked
-        with -- often relative to the project root (e.g. "src/hello.asm"),
-        not absolute, if the build ran with the project root as its cwd.
-        Caching a relative path as-is here clobbers the correct absolute
-        path handle_set_breakpoints already registered for the file whose
-        breakpoint triggered this parse, and nvim then can't find the file
-        at all when a stopped event names it (it resolves against nvim's
-        own cwd, not the build's) -- the source window just goes blank.
-        Resolve against the project root (the .sld file's own grandparent
-        directory, e.g. build/hello.sld -> project root) whenever the
-        recorded path isn't already absolute.
+        Field 0's path is whatever sjasmplus was invoked with, often
+        relative to the project root -- resolve it against the .sld file's
+        own grandparent directory when not absolute, otherwise nvim can't
+        find the file from a stopped event (it resolves paths against its
+        own cwd, not the build's) and the source window goes blank.
 
-        Also sets self.functions and self.globals from the 'L' records --
+        Also sets self.functions and self.globals from the 'L' records:
         self.functions so stack frames get a real label name instead of
-        falling back to "PC=0x...." the way SDCC's .cdb already does for
-        C builds (see _labels_to_functions); self.globals so the DAP
-        Globals scope has something to show (see _global_variables).
+        "PC=0x...." (see _labels_to_functions); self.globals for the DAP
+        Globals scope (see _global_variables).
         """
         line_to_addr = {}
         addr_to_source = {}
@@ -145,19 +135,13 @@ class DAPAdapter:
         """Extract one 'L' record into {'name','address','equ'}, appended
         to `labels`.
 
-        Data field (parts[7]) format: module,mainLabel,localLabel[,+trait...]
-        -- see the SLD spec's list of traits (+local, +equ, +macro, +used,
-        ...). Local sub-labels (localLabel non-empty, e.g. a `.loop` label
-        scoped under the preceding global label) are skipped entirely --
-        not a real global symbol, just a detail inside one; _func_name_at
-        should still report the enclosing global label while PC is inside
-        it, and the Globals scope has no use for internal loop counters.
-        '+equ' labels are kept (unlike in _labels_to_functions -- an EQU
-        constant, e.g. a hardware register address, is exactly the kind of
-        thing worth showing in a Globals scope) but tagged so callers can
-        tell a constant's *value* apart from a label's *address*.
-        Module-qualified names (module non-empty) are rendered "module.label"
-        to match sjasmplus's own qualified-name convention.
+        Data field (parts[7]) format: module,mainLabel,localLabel[,+trait...].
+        Local sub-labels (localLabel non-empty, e.g. a `.loop` label scoped
+        under the preceding global label) are skipped -- not a real global
+        symbol, and the Globals scope has no use for internal loop counters.
+        '+equ' labels are kept but tagged, so callers can tell a constant's
+        value apart from a label's address. Module-qualified names are
+        rendered "module.label" to match sjasmplus's own convention.
         """
         try:
             address = int(parts[5])
@@ -180,13 +164,11 @@ class DAPAdapter:
         start, end) ranges for _func_name_at: each label "owns" every
         address up to the next label's start.
 
-        SLD has no explicit function-boundary concept (a label is just an
-        address with a name) -- this is an approximation good enough for
-        naming a stack frame, not a substitute for real function-range
-        debug info like SDCC's .cdb G$/XG$ pairs provide. In particular a
-        label marking a data table, not a routine, would still "own" a
-        range here; harmless in practice since PC only ever lands on
-        addresses that are actually executed.
+        SLD has no explicit function-boundary concept, so this is an
+        approximation good enough for naming a stack frame -- not a
+        substitute for real function-range debug info like SDCC's .cdb
+        G$/XG$ pairs. A data-table label would "own" a range here too, but
+        that's harmless since PC only ever lands on executed addresses.
         """
         ordered = sorted(set(labels), key=lambda item: item[1])
         functions = []
@@ -208,13 +190,12 @@ class DAPAdapter:
             00004000  s__CODE
 
         This is only correct when _CODE is the lowest area in the linked
-        image, which is not always true -- a project can add its own (ABS)
-        area at a lower address (e.g. to .incbin a blob at a fixed spot).
-        ASxxxx's map output reports such (ABS,CON) areas' addresses as 0 in
-        every summary table, so there is no way to find their real address
-        from the .map file at all. parse_ihx_load_address() reads the true
-        minimum address straight from the .ihx and should be preferred
-        whenever a .ihx is available; this s__CODE guess is the fallback.
+        image, which isn't always true -- a project can add its own (ABS)
+        area at a lower address (e.g. to .incbin a blob at a fixed spot),
+        and ASxxxx's map output reports such areas' addresses as 0 in every
+        summary table. parse_ihx_load_address() reads the true minimum
+        address straight from the .ihx and should be preferred when
+        available; this s__CODE guess is the fallback.
 
         Returns (line_to_addr, addr_to_line, load_address).
         load_address is None if s__CODE is not found.
@@ -252,14 +233,11 @@ class DAPAdapter:
         """Read the true lowest address in a linked Intel HEX (.ihx) file.
 
         This is what hex2bin itself uses to decide where byte 0 of the .bin
-        goes, so it is authoritative -- unlike guessing from the .map file's
-        s__CODE symbol, it is correct even when the lowest area in the image
-        is an (ABS) area sdld doesn't report a real address for (see
-        parse_map's docstring). Records are not guaranteed to appear in
-        address order, so every type-00 (data) record is scanned; type-01
-        (EOF) and any others are ignored. Assumes flat 16-bit addressing
-        (true for a Z80 target, which never emits 02/04 extended-address
-        records) -- an .ihx using those would need them folded in here.
+        goes, so it's authoritative even when the lowest area is an (ABS)
+        area sdld can't report a real address for (see parse_map). Records
+        aren't guaranteed to appear in address order, so every type-00
+        (data) record is scanned. Assumes flat 16-bit addressing, true for
+        a Z80 target.
 
         Returns None if the file doesn't exist or has no data records.
         """
@@ -289,19 +267,15 @@ class DAPAdapter:
         """Parse a linker .map file's "Files Linked" table into each linked
         object's own base address, in link order.
 
-        "Files Linked" has rows `<obj path>.rel  [ <module> ]`, in the exact
-        order sdld placed each object's _CODE area -- the first one starts
-        at s__CODE, and every next one starts right after the previous
-        object's own _CODE area ends. Each object's _CODE size comes from
-        its own per-object .sym file's Area Table (`_CODE size B8`).
+        "Files Linked" has rows `<obj path>.rel  [ <module> ]`, in the order
+        sdld placed each object's _CODE area -- the first starts at
+        s__CODE, and each next one starts right after the previous
+        object's _CODE ends. Each object's _CODE size comes from its own
+        per-object .sym file's Area Table (`_CODE size B8`).
 
-        Deriving base addresses this way -- rather than from the minimum
-        address the global symbol table's "module" column attributes to a
-        module name -- matters because a module name isn't guaranteed
-        unique: this project has both wide_drawSolidBox.s and
-        wide_drawSpriteMasked.s declare `.module wide_sprites`, so the
-        symbol table's module column can't tell those two objects apart,
-        but their distinct positions in "Files Linked" still can.
+        Base addresses are derived this way rather than from the global
+        symbol table's "module" column, because a module name isn't
+        guaranteed unique across objects -- position in "Files Linked" is.
 
         Returns [{'module': str, 'obj_path': str, 'base_addr': int}, ...]
         in link order.
@@ -387,15 +361,13 @@ class DAPAdapter:
     def _resolve_module_source(self, obj_path, project_root):
         """Find the source file a linked object was assembled from.
 
-        Keyed by obj_path (unique per "Files Linked" row), not by the
-        `.module` name inside it -- see parse_map_module_info for why that
-        name can't be trusted to identify one object. Tries the project's
-        usual layout first: substitute the object tree's top-level
-        directory (e.g. "obj") for "src" in obj_path, keeping the rest of
-        the path, and probe common source extensions. Falls back to a
-        one-time recursive filename search under project_root for a file
-        whose stem matches the object's own filename stem, for projects
-        that don't mirror obj/ under src/.
+        Keyed by obj_path, not by the `.module` name inside it (see
+        parse_map_module_info for why that name isn't unique). Tries the
+        project's usual layout first: swap the object tree's top-level
+        directory (e.g. "obj") for "src" and probe common source
+        extensions. Falls back to a one-time recursive filename search
+        under project_root by stem, for projects that don't mirror obj/
+        under src/.
 
         Returns a full path string, or None if nothing matches.
         """
@@ -772,16 +744,14 @@ class DAPAdapter:
         dapui's Scopes "edit" prompt is inline in the tree buffer, prefilled
         with the register's current value. On at least some setups the
         submitted value ends up as that old value AND the freshly typed one
-        concatenated with a literal "> " prompt marker in between (order
-        not reliable either way -- confirmed both "old\\n> new" and
-        "new\\n> old" happening in practice), e.g. "0x8130\\n> 0x8114"
-        instead of just "0x8130". Rather than guess a fixed position,
-        parse every line as a candidate and, when there's more than one,
-        drop whichever one matches the register's actual current value --
-        that's the stale prefill, not what was typed. If that leaves more
-        than one candidate standing (or the current value can't be read),
-        fall back to the last one, since that's closest to "most recently
-        typed" in every observed case.
+        concatenated with a literal "> " prompt marker in between, order
+        not guaranteed either way, e.g. "0x8130\\n> 0x8114" instead of just
+        "0x8130". Rather than guess a fixed position, parse every line as a
+        candidate and, when there's more than one, drop whichever one
+        matches the register's actual current value -- that's the stale
+        prefill, not what was typed. If that leaves more than one candidate
+        standing (or the current value can't be read), fall back to the
+        last one, closest to "most recently typed".
         """
         segments = [seg for seg in raw_value.splitlines() if seg.strip()] or [raw_value]
         candidates = [(seg, self._hex_candidate(seg)) for seg in segments]
@@ -843,8 +813,8 @@ class DAPAdapter:
 
     def write_register(self, name: str, value: int) -> bool:
         """Write a single register. Return True on success. Subclasses
-        override; see zesarux.py (ZRCP `set-register`) and mame.py (GDB RSP
-        `G` write-all-registers, reusing _write_registers)."""
+        override; see zesarux.py (ZRCP `set-register`) and mame.py
+        (GDB RSP `P<index>=<value>`)."""
         raise NotImplementedError
 
     def handle_launch(self, msg):
@@ -886,11 +856,9 @@ class DAPAdapter:
 
     def cleanup_on_crash(self):
         """Best-effort cleanup when main()'s loop dies from an unhandled
-        exception -- normally handle_disconnect is what tears things down
-        (including killing an emulator process this adapter spawned), but
-        a crash skips straight past that, which would otherwise orphan the
-        emulator process silently forever. Subclasses override; no-op by
-        default since the base class has no process of its own to clean up.
+        exception, since a crash skips past handle_disconnect and would
+        otherwise orphan a spawned emulator process. Subclasses override;
+        no-op by default since the base class has no process to clean up.
         """
         pass
 

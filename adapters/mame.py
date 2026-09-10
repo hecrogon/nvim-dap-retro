@@ -13,9 +13,7 @@ MAME_HOST = 'localhost'
 MAME_DEFAULT_PORT = 2159
 LOG_FILE = '/tmp/mame-dap.log'
 
-# Z80 register order in MAME gdbstub g/G response.
-# Each register is 16-bit little-endian → 4 hex chars.
-_REG_NAMES = ['AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'SP', 'PC', "AF'", "BC'", "DE'", "HL'"]
+_REG_NAMES = ['AF', 'BC', 'DE', 'HL', "AF'", "BC'", "DE'", "HL'", 'IX', 'IY', 'SP', 'PC']
 
 
 class MameAdapter(DAPAdapter):
@@ -23,7 +21,11 @@ class MameAdapter(DAPAdapter):
         super().__init__(LOG_FILE)
         self._sock = None
         self._process = None
-        self._active_breakpoints = {}  # valid_line -> address
+        self._active_breakpoints = {}  # (basename, valid_line) -> address
+        self.map_file = None
+        self.cdb_file = None
+        self._load_address_explicit = False
+        self._setup_done = False
 
     # ── GDB RSP ───────────────────────────────────────────────────────────────
 
@@ -40,11 +42,15 @@ class MameAdapter(DAPAdapter):
     def gdb_recv(self):
         while True:
             c = self._sock.recv(1)
+            if not c:
+                raise ConnectionError('MAME gdbstub closed the connection (recv returned EOF)')
             if c == b'$':
                 break
         data = b''
         while True:
             c = self._sock.recv(1)
+            if not c:
+                raise ConnectionError('MAME gdbstub closed the connection (recv returned EOF)')
             if c == b'#':
                 break
             data += c
@@ -58,46 +64,69 @@ class MameAdapter(DAPAdapter):
         self.gdb_send(cmd)
         return self.gdb_recv()
 
+    def gdb_handshake(self):
+        """MAME's Z80 gdbstub rejects every `p`/`P` register packet with
+        `E01` until the client does the standard GDB negotiation --
+        `qSupported` followed by fetching `qXfer:features:read:target.xml`.
+        It also doesn't implement the bulk `g`/`G` packets (`g` always
+        answers `E01`), so registers are read/written one at a time via
+        `p<hex index>` / `P<hex index>=<value>` instead.
+        """
+        self.gdb_cmd('qSupported')
+        offset = 0
+        while True:
+            resp = self.gdb_cmd(f'qXfer:features:read:target.xml:{offset:x},1000')
+            if not resp or resp[0] not in ('l', 'm'):
+                break
+            offset += len(resp) - 1
+            if resp[0] == 'l':
+                break
+
+    def gdb_wait_for_boot(self, seconds):
+        """MAME's gdbstub halts the Z80 at true power-on reset (PC=0,
+        nothing executed yet) -- unlike ZEsarUX's hard-reset-cpu, which
+        fast-boots to a ready BASIC prompt internally before handing back
+        control. On real CPC hardware, firmware calls (e.g. `call &bc0e`)
+        don't jump into ROM directly -- they jump into a small RAM-resident
+        "jumpblock" the boot ROM installs during startup, so hijacking PC
+        before that runs sends firmware calls off into uninitialized RAM.
+
+        Let the CPU run the boot sequence for a bit, then interrupt it with
+        a raw break (0x03, the GDB RSP interrupt-target byte -- not a
+        `$...#cc` packet) before loading the user's binary and jumping to
+        it.
+        """
+        self.gdb_send('c')
+        time.sleep(seconds)
+        self._sock.sendall(b'\x03')
+        self.gdb_recv()
+
     # ── Registers ────────────────────────────────────────────────────────────
 
     def read_registers(self):
-        hex_str = self.gdb_cmd('g')
         regs = {}
         for i, name in enumerate(_REG_NAMES):
-            offset = i * 4
-            if offset + 4 > len(hex_str):
-                break
-            le = hex_str[offset:offset + 4]
+            le = self.gdb_cmd(f'p{i:x}')
+            if len(le) < 4:
+                continue
             regs[name] = (int(le[2:4], 16) << 8) | int(le[0:2], 16)
         return regs
 
-    def _write_registers(self, regs):
-        parts = []
-        for name in _REG_NAMES:
-            v = regs.get(name, 0)
-            parts.append(f'{v & 0xFF:02x}{(v >> 8) & 0xFF:02x}')
-        resp = self.gdb_cmd('G' + ''.join(parts))
-        logging.debug(f'write_registers response: {resp}')
-
-    def _set_pc(self, address):
-        regs = self.read_registers()
-        regs['PC'] = address
-        self._write_registers(regs)
-
     def write_register(self, name, value):
-        """GDB RSP has no single-register write for this stub's register
-        map (only `P n=val`, which needs the *index* into _REG_NAMES, not
-        a name) -- read-modify-write the whole block via `G` instead,
-        same as _set_pc already does. Only the 16-bit pairs in _REG_NAMES
-        (no 8-bit halves, no I/R -- MAME's Z80 gdbstub doesn't expose them
-        this way) are writable; anything else is reported as a failure.
+        """`P<hex index>=<value>` writes one register directly. Only the
+        16-bit pairs in _REG_NAMES are writable (no 8-bit halves, no I/R --
+        MAME's Z80 gdbstub doesn't expose them this way); anything else is
+        reported as a failure.
         """
         if name not in _REG_NAMES:
             return False
-        regs = self.read_registers()
-        regs[name] = value
-        self._write_registers(regs)
-        return True
+        i = _REG_NAMES.index(name)
+        le = f'{value & 0xFF:02x}{(value >> 8) & 0xFF:02x}'
+        resp = self.gdb_cmd(f'P{i:x}={le}')
+        return resp == 'OK'
+
+    def _set_pc(self, address):
+        self.write_register('PC', address)
 
     # ── Memory helpers ────────────────────────────────────────────────────────
 
@@ -143,8 +172,16 @@ class MameAdapter(DAPAdapter):
             self.bin_file = Path(args['program'])
         if 'sldFile' in args:
             self.sld_file = Path(args['sldFile'])
+        if 'mapFile' in args:
+            self.map_file = Path(args['mapFile'])
+            candidate = self.map_file.with_suffix('.cdb')
+            if candidate.exists():
+                self.cdb_file = candidate
+        if 'cdbFile' in args:
+            self.cdb_file = Path(args['cdbFile'])
         if 'loadAddress' in args:
             self._load_address = int(str(args['loadAddress']), 0)
+            self._load_address_explicit = True
 
         if 'mameArgs' in args:
             mame_bin = args.get('mamePath', 'mame')
@@ -155,10 +192,15 @@ class MameAdapter(DAPAdapter):
             ]
             logging.debug(f'Launching MAME: {launch_cmd}')
             self._process = subprocess.Popen(launch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._wait_for_mame(port)
 
-        self._sock = socket.create_connection((MAME_HOST, port))
+        boot_delay = float(args.get('bootDelay', 2.0))
+
+        self._sock = self._connect_to_mame(port)
         logging.debug('Connected to MAME gdbstub')
+        self.gdb_handshake()
+        if boot_delay > 0:
+            logging.debug(f'Letting the machine boot for {boot_delay}s before loading the binary')
+            self.gdb_wait_for_boot(boot_delay)
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
@@ -166,28 +208,104 @@ class MameAdapter(DAPAdapter):
             'success': True,
         })
 
-    def _wait_for_mame(self, port, timeout=15):
+    def _connect_to_mame(self, port, timeout=15):
+        """Retry the real gdbstub connection directly rather than probing
+        with a disposable connect-then-close first: MAME's Z80 gdbstub only
+        ever accepts one client for its whole process lifetime, so a
+        throwaway probe connection burns that slot -- the real connection
+        right after would complete at the TCP level but get reset the
+        moment protocol data is sent.
+
+        create_connection's `timeout` sticks on the returned socket, not
+        just the connect attempt, so it's reset to blocking once actually
+        connected -- otherwise a program that takes longer than `timeout`
+        to reach a breakpoint would make _monitor_stop's blocking
+        gdb_recv() time out mid-wait and die silently in its thread,
+        leaving the CPU running with no 'stopped' event ever sent.
+        """
         deadline = time.time() + timeout
+        last_err = None
         while time.time() < deadline:
             try:
-                s = socket.create_connection((MAME_HOST, port), timeout=0.5)
-                s.close()
-                return
-            except (ConnectionRefusedError, OSError):
+                sock = socket.create_connection((MAME_HOST, port), timeout=0.5)
+                sock.settimeout(None)
+                return sock
+            except (ConnectionRefusedError, OSError) as e:
+                last_err = e
                 time.sleep(0.5)
-        raise RuntimeError(f'MAME did not start within {timeout}s')
+        raise RuntimeError(f'MAME did not start within {timeout}s') from last_err
+
+    def _load_binary(self, source_path=None):
+        """Resolve debug info (.map+.cdb for C/SDCC builds, or plain .sld
+        for hand-written assembly) and write the binary into CPC RAM.
+        Mirrors zesarux.py's _load_binary, except the final load step is a
+        raw GDB memory write instead of ZRCP's load-binary command -- no
+        separate "enable breakpoints" step needed since GDB Z/z breakpoints
+        are live the instant they're inserted.
+
+        Idempotent (guarded by self._setup_done): both
+        handle_set_breakpoints and handle_configuration_done call this,
+        the latter as a safety net in case a DAP client skips
+        setBreakpoints.
+        """
+        if self._setup_done:
+            return
+        has_debug = self.sld_file is not None or self.map_file is not None
+        if self.bin_file is None or not has_debug:
+            if source_path is None:
+                logging.error('No source path available to resolve bin/sld files')
+                return
+            sp = Path(source_path)
+            project_root = sp.parent.parent
+            name = sp.stem
+            resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
+            resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
+            resolved_map = self.map_file
+        else:
+            resolved_bin = self.bin_file
+            resolved_sld = self.sld_file
+            resolved_map = self.map_file
+
+        if resolved_map is not None:
+            self.sld_map, self.address_to_source, map_load_address = self.parse_map(resolved_map)
+        elif resolved_sld is not None:
+            self.sld_map, self.address_to_source = self.parse_sld(resolved_sld)
+            map_load_address = None
+        else:
+            map_load_address = None
+
+        if not self._load_address_explicit:
+            ihx_load_address = self.parse_ihx_load_address(resolved_bin.with_suffix('.ihx'))
+            if ihx_load_address is not None:
+                self._load_address = ihx_load_address
+                logging.debug(f'Load address from .ihx: 0x{self._load_address:04x}')
+            elif map_load_address is not None:
+                self._load_address = map_load_address
+                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
+
+        if self.cdb_file is not None:
+            cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
+            self.sld_map.update(cdb_lines)
+            self.address_to_source.update(cdb_addrs)
+            logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
+
+        if resolved_map is not None:
+            asm_lines = self.build_asm_line_map(resolved_map)
+            added = 0
+            for addr, entry in asm_lines.items():
+                if addr not in self.address_to_source:
+                    self.address_to_source[addr] = entry
+                    added += 1
+            logging.debug(f'LST: filled {added} addr->line gaps from module listings')
+
+        logging.debug(f'Loading binary {resolved_bin} at 0x{self._load_address:04x}')
+        self._write_memory_gdb(self._load_address, resolved_bin.read_bytes())
+        self._setup_done = True
 
     def handle_set_breakpoints(self, msg):
         self._source_path = msg['arguments']['source']['path']
         self._register_source_path(self._source_path)
-
-        if self.sld_file is None and self._source_path:
-            source_path = Path(self._source_path)
-            project_root = source_path.parent.parent
-            self.sld_file = project_root / 'build' / f'{source_path.stem}.sld'
-
-        if self.sld_file and self.sld_file.exists() and not self.sld_map:
-            self.sld_map, self.address_to_source = self.parse_sld(self.sld_file)
+        self._load_binary(self._source_path)
 
         for addr in self._active_breakpoints.values():
             resp = self.gdb_cmd(f'z0,{addr:x},1')
@@ -219,23 +337,51 @@ class MameAdapter(DAPAdapter):
             'body': {'breakpoints': breakpoints},
         })
 
+    def _step_over_breakpoint_at(self, pc):
+        """A plain `c` never reports a stop if PC is already sitting on an
+        active breakpoint address and execution never naturally revisits
+        that exact address -- it just hangs. When *resuming* from a
+        breakpoint the user already saw, step over it silently before
+        continuing (GDB itself does the same), used from handle_continue.
+
+        Not used at entry (handle_configuration_done): landing exactly on
+        a breakpoint there -- main()'s first line is a common spot for one
+        -- should be reported as a real breakpoint hit, not skipped before
+        the user ever sees it.
+        """
+        if pc in self._active_breakpoints.values():
+            logging.debug(f'PC {pc:#06x} is an active breakpoint -- single-stepping over it before continuing')
+            self.gdb_cmd('s')
+
     def handle_configuration_done(self, msg):
-        if self.bin_file and self.bin_file.exists():
-            logging.debug(f'Loading binary {self.bin_file} at {self._load_address:#x}')
-            self._write_memory_gdb(self._load_address, self.bin_file.read_bytes())
-            self._set_pc(self._load_address)
+        self._load_binary(getattr(self, '_source_path', None))
+        # For C/SDCC builds self._load_address is the start of the whole
+        # image (crt0 startup code), not main() -- jump straight to main
+        # when CDB info identifies it, same as zesarux.py.
+        entry = next((start for name, start, end in self.functions if name == 'main'), self._load_address)
+        self._set_pc(entry)
 
-        if self.sld_file and self.sld_file.exists() and not self.sld_map:
-            self.sld_map, self.address_to_source = self.parse_sld(self.sld_file)
-
-        self.gdb_send('c')
-        self.start_monitor('entry')
+        landed_on_breakpoint = entry in self._active_breakpoints.values()
+        if not landed_on_breakpoint:
+            self.gdb_send('c')
+            self.start_monitor('entry')
         self.send({
             'type': 'response',
             'request_seq': msg['seq'],
             'command': 'configurationDone',
             'success': True,
         })
+        if landed_on_breakpoint:
+            # See _step_over_breakpoint_at -- a `c` from here would just
+            # hang (main() typically never revisits its own first line),
+            # and skipping it via a silent step would mean the user's
+            # breakpoint on main()'s first line never actually gets shown.
+            # We're already sitting exactly where it should fire.
+            self.send({
+                'type': 'event',
+                'event': 'stopped',
+                'body': {'reason': 'breakpoint', 'threadId': 1, 'allThreadsStopped': True},
+            })
 
     def handle_read_memory(self, msg):
         args = msg['arguments']
@@ -271,6 +417,9 @@ class MameAdapter(DAPAdapter):
         })
 
     def handle_continue(self, msg):
+        pc = self.read_registers().get('PC')
+        if pc is not None:
+            self._step_over_breakpoint_at(pc)
         self.gdb_send('c')
         self.start_monitor('breakpoint')
         self.send({
@@ -282,16 +431,22 @@ class MameAdapter(DAPAdapter):
         })
 
     def _terminate_spawned_process(self):
-        """Kill the MAME process this adapter launched, if any. Shared by
-        the normal handle_disconnect path and cleanup_on_crash (see
-        base.py) -- a crash must not leave a spawned MAME process orphaned
-        just because it skipped the normal disconnect sequence.
+        """Kill the MAME process this adapter launched, if any.
         """
-        if self._process:
+        if not self._process:
+            return
+        try:
+            self._process.terminate()
+            self._process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            logging.debug('MAME ignored SIGTERM (likely paused at a debugger break) -- sending SIGKILL')
             try:
-                self._process.terminate()
+                self._process.kill()
+                self._process.wait(timeout=2)
             except Exception:
                 pass
+        except Exception:
+            pass
 
     def cleanup_on_crash(self):
         self._terminate_spawned_process()
@@ -300,7 +455,7 @@ class MameAdapter(DAPAdapter):
         if self._sock:
             try:
                 if self._process:
-                    self.gdb_cmd('k')  # tell MAME to exit (can't reconnect anyway)
+                    self.gdb_cmd('k')  # tell MAME to exit
             except Exception:
                 pass
             try:

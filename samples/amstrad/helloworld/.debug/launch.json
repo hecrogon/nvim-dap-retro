@@ -11,6 +11,18 @@
       "sldFile": "${workspaceFolder}/build/hello.sld",
       "loadAddress": "0x4000",
       "preLaunchTask": "build"
+    },
+    {
+      "type": "mame",
+      "request": "launch",
+      "name": "MAME Debug",
+      "mamePath": "mame",
+      "mamePort": 2159,
+      "mameArgs": ["cpc6128", "-skip_gameinfo"],
+      "program": "${workspaceFolder}/build/hello.bin",
+      "sldFile": "${workspaceFolder}/build/hello.sld",
+      "loadAddress": "0x4000",
+      "preLaunchTask": "build"
     }
   ]
 }

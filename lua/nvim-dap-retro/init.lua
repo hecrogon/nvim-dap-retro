@@ -126,45 +126,19 @@ local function run_task(task, on_success)
   })
 end
 
-local function load_debug_launch_config(adapter)
+local function read_launch_configs()
   local path = vim.fn.getcwd() .. "/.debug/launch.json"
   if vim.fn.filereadable(path) == 0 then return nil end
   local ok, content = pcall(vim.fn.readfile, path)
   if not ok then return nil end
   local ok2, parsed = pcall(vim.fn.json_decode, table.concat(content, "\n"))
   if not ok2 then return nil end
-  for _, c in ipairs(parsed.configurations or {}) do
-    if c.type == adapter then return c end
-  end
+  local configs = parsed.configurations or {}
+  if #configs == 0 then return nil end
+  return configs
 end
 
-M.debug = function()
-  local ext = vim.fn.expand("%:e")
-  local adapter = M.ext_map[ext]
-  if not adapter then
-    vim.notify("nvim-dap-retro: no adapter for extension '." .. ext .. "'", vim.log.levels.WARN)
-    return
-  end
-
-  local dap = require("dap")
-  local config = load_debug_launch_config(adapter)
-  if not config then
-    for _, ft_configs in pairs(dap.configurations) do
-      for _, c in ipairs(ft_configs) do
-        if c.type == adapter then
-          config = c
-          break
-        end
-      end
-      if config then break end
-    end
-  end
-
-  if not config then
-    vim.notify("nvim-dap-retro: no DAP configuration found for adapter '" .. adapter .. "'", vim.log.levels.WARN)
-    return
-  end
-
+local function start_config(dap, config)
   if config.preLaunchTask then
     local task = resolve_task(config.preLaunchTask)
     if not task then
@@ -175,6 +149,57 @@ M.debug = function()
   else
     dap.run(config)
   end
+end
+
+M.debug = function()
+  local dap = require("dap")
+  local configs = read_launch_configs()
+
+  -- .debug/launch.json present: let the user pick among its named
+  -- configurations (VSCode-style) instead of guessing a single adapter
+  -- from the file extension -- a project can offer more than one way to
+  -- run the same source (e.g. ZEsarUX vs MAME for the same .asm file).
+  if configs then
+    if #configs == 1 then
+      start_config(dap, configs[1])
+    else
+      vim.ui.select(configs, {
+        prompt = "nvim-dap-retro: select a debug configuration",
+        format_item = function(c) return c.name or c.type end,
+      }, function(choice)
+        if choice then start_config(dap, choice) end
+      end)
+    end
+    return
+  end
+
+  -- No launch.json (or an empty one): fall back to the extension -> adapter
+  -- default and whatever configs the adapter itself registered in
+  -- dap.configurations.
+  local ext = vim.fn.expand("%:e")
+  local adapter = M.ext_map[ext]
+  if not adapter then
+    vim.notify("nvim-dap-retro: no adapter for extension '." .. ext .. "'", vim.log.levels.WARN)
+    return
+  end
+
+  local config
+  for _, ft_configs in pairs(dap.configurations) do
+    for _, c in ipairs(ft_configs) do
+      if c.type == adapter then
+        config = c
+        break
+      end
+    end
+    if config then break end
+  end
+
+  if not config then
+    vim.notify("nvim-dap-retro: no DAP configuration found for adapter '" .. adapter .. "'", vim.log.levels.WARN)
+    return
+  end
+
+  start_config(dap, config)
 end
 
 return M

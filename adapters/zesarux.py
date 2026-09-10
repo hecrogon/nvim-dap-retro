@@ -108,15 +108,11 @@ class ZesaruxAdapter(DAPAdapter):
 
         Bounded by `timeout` (seconds), except when a caller explicitly
         passes None -- used only by the continue/run monitor thread, where
-        blocking for as long as the debuggee actually runs before hitting
-        a breakpoint (which could legitimately be minutes, e.g. waiting on
-        a keypress) is the whole point. Every other caller wants a fast,
-        real ZRCP round-trip; if the connection is dead or ZEsarUX has
-        stalled, hitting this bound raises rather than hanging this
-        process forever with no feedback -- turning that into a prompt,
-        visible crash that nvim-dap's own adapter-exit notification
-        already surfaces well (":DapShowLog" pointer + a stderr log with
-        this exception's message and traceback).
+        blocking as long as the debuggee runs before hitting a breakpoint
+        (could legitimately be minutes) is the whole point. Every other
+        caller wants a fast round-trip; if the connection is dead or
+        ZEsarUX has stalled, hitting this bound raises instead of hanging
+        the process forever with no feedback.
         """
         data = b''
         if timeout is not None:
@@ -162,12 +158,11 @@ class ZesaruxAdapter(DAPAdapter):
 
     def write_register(self, name, value):
         """`set-register NAME=VALUEh` -- accepts PC/SP/IX/IY/AF/BC/DE/HL
-        (+ their ' shadows), the 8-bit halves, and I/R/IFF1/IFF2 (verified
-        against ZEsarUX's own debug_change_register() source). MEMPTR and
-        MMU are shown in the Registers scope (read_registers regex-matches
-        whatever get-registers reports) but aren't real settable registers
-        -- ZEsarUX just replies "Error changing register" for those, which
-        this reports back as a normal write failure.
+        (+ their ' shadows), the 8-bit halves, and I/R/IFF1/IFF2. MEMPTR
+        and MMU show up in the Registers scope (read_registers just
+        regex-matches whatever get-registers reports) but aren't real
+        settable registers -- ZEsarUX replies "Error changing register"
+        for those, reported back here as a normal write failure.
         """
         logging.debug(f'ZRCP >>> set-register {name}={value:x}h')
         self._sock.sendall(f'set-register {name}={value:x}h\n'.encode('ascii'))
@@ -188,31 +183,25 @@ class ZesaruxAdapter(DAPAdapter):
     def close_all_menus(self):
         """close-all-menus can take longer than zesarux_send's 0.1s budget
         to reply -- e.g. dismissing ZEsarUX's native Debug popup, which is
-        conspicuously slow the first time it's shown. Read reliably here so
-        a late reply can't sit unread in the socket and get consumed by
-        whatever ZRCP command runs next (observed corrupting both a
-        following read-memory call and, via _monitor_breakpoint, a
-        following get-registers call).
+        slow the first time it's shown. Read reliably here so a late reply
+        can't sit unread in the socket and get consumed by whatever ZRCP
+        command runs next (a following read-memory or get-registers call).
         """
         self._sock.sendall(b'close-all-menus\n')
         self.zesarux_recv_until_prompt()
 
     def enter_cpu_step(self):
-        """enter-cpu-step can take ZEsarUX itself up to ~3s internally
-        (it waits out any menu still closing, then waits for its own
-        acknowledgement) -- far past zesarux_send's 0.1s budget, so a
-        plain zesarux_send here just returns empty and leaves the real,
-        delayed reply (often "Error. Can not enter cpu step mode. You can
-        try closing the menu") to be misread by whatever command happens
-        to call zesarux_recv_until_prompt next.
+        """enter-cpu-step can take ZEsarUX up to ~3s internally (waiting
+        out any menu still closing, then its own acknowledgement) -- far
+        past zesarux_send's 0.1s budget, so use zesarux_recv_until_prompt
+        instead.
 
-        A stuck menu left over from a previous session's ZEsarUX process
-        (e.g. one this adapter attached to instead of spawning fresh) is
-        the usual cause of that error; one extra close-all-menus + retry
-        clears it. If it still won't take, raise rather than silently
-        report launch success -- the debuggee would never actually run
-        (continue/run all require this mode) and the eventual failure is
-        much harder to diagnose than a clear error at launch time.
+        A stuck menu left over from a previous ZEsarUX process (e.g. one
+        this adapter attached to instead of spawning fresh) is the usual
+        cause of an "Error. Can not enter cpu step mode" reply; one extra
+        close-all-menus + retry clears it. If it still won't take, raise
+        rather than silently reporting launch success -- the debuggee
+        would never actually run.
         """
         self._sock.sendall(b'enter-cpu-step\n')
         response = self.zesarux_recv_until_prompt()
@@ -558,28 +547,20 @@ class ZesaruxAdapter(DAPAdapter):
     @staticmethod
     def _parse_io_ports(response):
         """Parse a get-io-ports response into (top_level, sections) for a
-        grouped/expandable DAP variables tree, generically.
-
-        Three line shapes, recognized purely by structure (no section names
-        hardcoded):
-          - "Some Section:"      (colon, nothing after it) -- a section
-            header, e.g. "CRTC Registers:", "PD765 status:", "AY-3-8912
-            chip 0:". Opens a new group in `sections`; doesn't emit a
-            variable itself (it becomes the group's own tree node, built
-            by the caller with a variablesReference pointing at its
-            children).
-          - "NN: NN"             (2 hex digits, colon, 2 hex digits) -- one
-            entry of an indexed register table, nested under the current
-            section's group (or top-level if none is open), e.g. CRTC/Gate
-            Array/AY-3-8912's "00:  3F" rows. Named bare "RNN" -- safe to
-            drop the section-name prefix a flatter representation would
-            have needed, since each table is now its own group and every
-            table restarts at 00 regardless.
-          - "Some Key: value"    (colon, something after it) -- a plain
-            field, e.g. "ULA Data Bus value: FFH", "PPI Port A:  00",
-            "Motor: Off". Nested under the current section the same way.
-        Anything else (blank lines, decorative continuation lines like
-        "(RQM    )" with no colon at all) is skipped.
+        grouped/expandable DAP variables tree, generically -- no section
+        names hardcoded, just three line shapes recognized by structure:
+          - "Some Section:"   (colon, nothing after it) -- a section header,
+            e.g. "CRTC Registers:", "AY-3-8912 chip 0:". Opens a new group
+            in `sections`; the caller turns it into a tree node pointing
+            at its children.
+          - "NN: NN"          (2 hex digits, colon, 2 hex digits) -- one
+            entry of an indexed register table, e.g. CRTC/Gate Array's
+            "00:  3F" rows. Named bare "RNN" since each table is its own
+            group and every table restarts at 00 regardless.
+          - "Some Key: value" (colon, something after it) -- a plain field,
+            e.g. "ULA Data Bus value: FFH", "Motor: Off".
+        Anything else (blank lines, decorative lines with no colon) is
+        skipped.
 
         Returns (top_level_vars, {section_name: [child_vars]}), both in
         the order they first appeared.

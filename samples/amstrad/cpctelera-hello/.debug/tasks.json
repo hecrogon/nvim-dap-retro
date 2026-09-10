@@ -1,9 +1,0 @@
-{
-  "tasks": [
-    {
-      "label": "build",
-      "command": "make",
-      "args": []
-    }
-  ]
-}

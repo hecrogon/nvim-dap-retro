@@ -9,8 +9,8 @@ A [nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin for debugging retr
 - [nvim-dap-ui](https://github.com/rcarriga/nvim-dap-ui) (optional, for the UI panels)
 - [nvim-nio](https://github.com/nvim-neotest/nvim-nio) (required by nvim-dap-ui)
 - Python 3 (for the adapter scripts)
-- [ZEsarUX](https://github.com/chernandezba/zesarux)
-- [sjasmplus](https://github.com/z00m128/sjasmplus) — the only assembler currently supported, as the adapter relies on its [SLD debug symbol format](https://github.com/z00m128/sjasmplus/blob/master/documentation/SLD.md) for line↔address mapping. Support for other assemblers (pasmo, nasm, etc.) would require adding a parser for their symbol/map output.
+- [ZEsarUX](https://github.com/chernandezba/zesarux) and/or [MAME](https://www.mamedev.org/) — an emulator with a Z80 target. ZEsarUX is debugged via its ZRCP protocol; MAME via its built-in GDB Remote Serial Protocol stub. Either one is enough on its own; you don't need both.
+- [sjasmplus](https://github.com/z00m128/sjasmplus) — the only assembler with dedicated support, via its [SLD debug symbol format](https://github.com/z00m128/sjasmplus/blob/master/documentation/SLD.md) for line↔address mapping. SDCC's `.map`/`.cdb` output is also supported (see below). Other assemblers (pasmo, nasm, etc.) would need a parser for their own symbol/map output.
 
 ## Installation
 
@@ -277,12 +277,12 @@ The `samples/` directory contains ready-to-debug projects:
 
 | Sample | Target | Description |
 |--------|--------|-------------|
-| `amstrad/helloworld` | Amstrad CPC 6128 | Prints `HELLO` and draws pixels |
+| `amstrad/helloworld` | Amstrad CPC 6128 | Prints `HELLO` |
 | `spectrum/helloworld` | ZX Spectrum 48K | Prints `HELLO` |
 
 Each sample includes the Z80 source and a `.debug/` configuration. Bring your own build system — the samples use `sjasmplus` but any assembler that produces a `.bin` + `.sld` pair will work.
 
-<!-- ## MAME adapter (not yet implemented)
+## MAME adapter
 
 The MAME adapter speaks the GDB Remote Serial Protocol to MAME's built-in gdbstub. It supports any MAME system that exposes a Z80 CPU.
 
@@ -294,7 +294,7 @@ Add a `mameArgs` field to your `launch.json` with the system name and any extra 
 "mameArgs": ["cpc6128", "-window"]
 ```
 
-MAME will be started when the debug session begins and sent the `k` (kill) command on disconnect.
+MAME will be started when the debug session begins and sent the `k` (kill) command on disconnect. On connect, the adapter performs MAME's required GDB handshake and then lets the machine run for `bootDelay` seconds (default `2.0`) before halting it and loading the binary — MAME's gdbstub halts at true power-on reset with RAM uninitialized, and firmware calls (e.g. `call &bc0e` on CPC) jump through a RAM-resident jumpblock that only exists once the boot ROM has actually run. If your target boots slower or faster than the default, adjust `bootDelay` accordingly.
 
 If you prefer to manage MAME yourself, omit `mameArgs` and start it manually:
 
@@ -324,11 +324,14 @@ mame cpc6128 -window -debugger gdbstub -debug -debugger_port 2159
 | Field | Description |
 |-------|-------------|
 | `program` | Binary to load into RAM at `loadAddress`. Optional — omit if MAME already has the program. |
-| `sldFile` | SLD debug symbols file. Inferred from source filename if omitted. |
-| `loadAddress` | Address where the binary is written (hex or decimal). Defaults to `0`. |
+| `sldFile` | sjasmplus SLD debug symbols file. Inferred from source filename if omitted. |
+| `mapFile` | SDCC `.map` file, as an alternative to `sldFile` for C/SDCC projects. A sibling `.cdb` file (same basename) is picked up automatically if present, for function ranges, line mapping and locals. |
+| `cdbFile` | SDCC `.cdb` file, if it doesn't sit alongside `mapFile` under the same basename. |
+| `loadAddress` | Address where the binary is written (hex or decimal). Defaults to `0`, or is inferred from the `.ihx`/`.map` file's `s__CODE` start address when omitted and a map file is given. |
 | `mameArgs` | System name + extra flags passed to MAME. When present, the adapter launches MAME automatically. `-debugger gdbstub -debug -debugger_port PORT` are always appended. |
 | `mamePort` | GDB stub port. Defaults to `2159`. |
 | `mamePath` | Path to the MAME binary. Defaults to `mame` (assumed to be in `$PATH`). |
+| `bootDelay` | Seconds to let the machine boot before halting it and loading the binary. Defaults to `2.0`. Set to `0` to skip (only useful if MAME is already sitting at a state where firmware RAM is initialized). |
 
 > **Note:** MAME's gdbstub does not support reconnection (MAME bug [#9578](https://github.com/mamedev/mame/issues/9578)). The adapter sends `k` on disconnect to terminate MAME. Restart MAME between sessions.
 
@@ -343,12 +346,12 @@ require("nvim-dap-retro").setup({
   },
 })
 ```
--->
 
 ## Troubleshooting
 
-The adapter logs all DAP messages and emulator traffic to `/tmp/zesarux-dap.log`. Tail it while debugging:
+Each adapter logs all DAP messages and emulator traffic to its own file. Tail the relevant one while debugging:
 
 ```sh
-tail -f /tmp/zesarux-dap.log
+tail -f /tmp/zesarux-dap.log   # ZEsarUX adapter
+tail -f /tmp/mame-dap.log      # MAME adapter
 ```

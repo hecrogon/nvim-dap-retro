@@ -20,18 +20,6 @@ main:
     ld a,'o'
     call print_char
 
-    ld hl,0xc370
-    ld c,11d
-pixel_loop:
-    ld (hl),255
-    inc hl
-
-    dec c
-    jp nz,pixel_loop
-
-    ld hl,0xcb70
-    ld (hl),255
-
     call wait_char
 
     ret
