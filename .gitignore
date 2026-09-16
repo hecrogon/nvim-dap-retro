@@ -1,0 +1,5 @@
+__pycache__/
+samples/**/build/
+samples/**/obj/
+*.idx
+TODO.md
