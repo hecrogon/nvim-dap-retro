@@ -12,12 +12,17 @@ M.setup = function(dap)
     args = { plugin_root .. "/adapters/zesarux.py" },
   }
 
+  -- Bundled fallback for projects with no .debug/launch.json. zesaruxArgs matters:
+  -- without it the adapter never starts an emulator, it only attaches to whatever is
+  -- already on the default port -- which means inheriting a previous session's state.
+  -- Leaving zesaruxPort unset lets each session claim its own free port instead.
   dap.configurations.asm = {
     {
       type = "zesarux",
       request = "launch",
       name = "ZEsarUX Debug",
       preLaunchTask = "make build",
+      zesaruxArgs = { "--machine", "cpc6128", "--snap-no-change-machine", "--disable-autoframeskip" },
     },
   }
 end

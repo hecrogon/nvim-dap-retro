@@ -22,10 +22,6 @@ class MameAdapter(DAPAdapter):
         self._sock = None
         self._process = None
         self._active_breakpoints = {}  # (basename, valid_line) -> address
-        self.map_file = None
-        self.cdb_file = None
-        self._load_address_explicit = False
-        self._setup_done = False
 
     # ── GDB RSP ───────────────────────────────────────────────────────────────
 
@@ -134,11 +130,7 @@ class MameAdapter(DAPAdapter):
     def _monitor_stop(self, reason):
         resp = self.gdb_recv()
         logging.debug(f'MAME stopped ({reason}): {resp}')
-        self.send({
-            'type': 'event',
-            'event': 'stopped',
-            'body': {'reason': reason, 'threadId': 1, 'allThreadsStopped': True},
-        })
+        self.send_stopped(reason)
 
     def start_monitor(self, reason='breakpoint'):
         t = threading.Thread(target=self._monitor_stop, args=(reason,), daemon=True)
@@ -149,20 +141,7 @@ class MameAdapter(DAPAdapter):
     def handle_launch(self, msg):
         args = msg.get('arguments', {})
         port = int(args.get('mamePort', MAME_DEFAULT_PORT))
-        if 'program' in args:
-            self.bin_file = Path(args['program'])
-        if 'sldFile' in args:
-            self.sld_file = Path(args['sldFile'])
-        if 'mapFile' in args:
-            self.map_file = Path(args['mapFile'])
-            candidate = self.map_file.with_suffix('.cdb')
-            if candidate.exists():
-                self.cdb_file = candidate
-        if 'cdbFile' in args:
-            self.cdb_file = Path(args['cdbFile'])
-        if 'loadAddress' in args:
-            self._load_address = int(str(args['loadAddress']), 0)
-            self._load_address_explicit = True
+        self.read_symbol_args(args)
 
         if 'mameArgs' in args:
             mame_bin = args.get('mamePath', 'mame')
@@ -182,12 +161,7 @@ class MameAdapter(DAPAdapter):
         if boot_delay > 0:
             logging.debug(f'Letting the machine boot for {boot_delay}s before loading the binary')
             self.gdb_wait_for_boot(boot_delay)
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'launch',
-            'success': True,
-        })
+        self.respond(msg)
 
     def _connect_to_mame(self, port, timeout=15):
         # Retries the actual connection directly, no throwaway probe first -- MAME's gdbstub
@@ -206,63 +180,16 @@ class MameAdapter(DAPAdapter):
         raise RuntimeError(f'MAME did not start within {timeout}s') from last_err
 
     def _load_binary(self, source_path=None):
-        # Same idea as zesarux.py's _load_binary, but loading here is a raw GDB memory write
-        # -- no separate "enable breakpoints" step, since GDB breakpoints go live as soon as
-        # they're set. Safe to call more than once (self._setup_done guards it); both
-        # handle_set_breakpoints and handle_configuration_done call it, the latter just as
-        # a safety net in case a DAP client skips setBreakpoints.
+        # Runs once per session, from whichever of setBreakpoints/configurationDone arrives
+        # first. There's no "enable breakpoints" step here -- GDB breakpoints go live as
+        # soon as they're set.
         if self._setup_done:
             return
-        has_debug = self.sld_file is not None or self.map_file is not None
-        if self.bin_file is None or not has_debug:
-            if source_path is None:
-                logging.error('No source path available to resolve bin/sld files')
-                return
-            sp = Path(source_path)
-            project_root = sp.parent.parent
-            name = sp.stem
-            resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
-            resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
-            resolved_map = self.map_file
-        else:
-            resolved_bin = self.bin_file
-            resolved_sld = self.sld_file
-            resolved_map = self.map_file
-
-        if resolved_map is not None:
-            self.sld_map, self.address_to_source, map_load_address = self.parse_map(resolved_map)
-        elif resolved_sld is not None:
-            self.sld_map, self.address_to_source = self.parse_sld(resolved_sld)
-            map_load_address = None
-        else:
-            map_load_address = None
-
-        if not self._load_address_explicit:
-            ihx_load_address = self.parse_ihx_load_address(resolved_bin.with_suffix('.ihx'))
-            if ihx_load_address is not None:
-                self._load_address = ihx_load_address
-                logging.debug(f'Load address from .ihx: 0x{self._load_address:04x}')
-            elif map_load_address is not None:
-                self._load_address = map_load_address
-                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
-
-        if self.cdb_file is not None:
-            cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
-            self.sld_map.update(cdb_lines)
-            self.address_to_source.update(cdb_addrs)
-            logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
-
-        if resolved_map is not None:
-            asm_lines = self.build_asm_line_map(resolved_map)
-            added = 0
-            for addr, entry in asm_lines.items():
-                if addr not in self.address_to_source:
-                    self.address_to_source[addr] = entry
-                    added += 1
-            logging.debug(f'LST: filled {added} addr->line gaps from module listings')
-
-        logging.debug(f'Loading binary {resolved_bin} at 0x{self._load_address:04x}')
-        self._write_memory_gdb(self._load_address, resolved_bin.read_bytes())
+        binary = self.load_debug_info(source_path)
+        if binary is None:
+            return
+        logging.debug(f'Loading binary {binary} at 0x{self._load_address:04x}')
+        self._write_memory_gdb(self._load_address, binary.read_bytes())
         self._setup_done = True
 
     def handle_set_breakpoints(self, msg):
@@ -292,13 +219,7 @@ class MameAdapter(DAPAdapter):
             else:
                 breakpoints.append({'verified': False, 'line': line})
 
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'setBreakpoints',
-            'success': True,
-            'body': {'breakpoints': breakpoints},
-        })
+        self.respond(msg, {'breakpoints': breakpoints})
 
     def _step_over_breakpoint_at(self, pc):
         # A plain `c` just hangs if PC is already sitting on a breakpoint. Only used from
@@ -318,52 +239,25 @@ class MameAdapter(DAPAdapter):
         if not landed_on_breakpoint:
             self.gdb_send('c')
             self.start_monitor('entry')
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'configurationDone',
-            'success': True,
-        })
+        self.respond(msg)
         if landed_on_breakpoint:
             # See _step_over_breakpoint_at -- already sitting exactly where the breakpoint fires.
-            self.send({
-                'type': 'event',
-                'event': 'stopped',
-                'body': {'reason': 'breakpoint', 'threadId': 1, 'allThreadsStopped': True},
-            })
+            self.send_stopped('breakpoint')
 
     def handle_read_memory(self, msg):
         args = msg['arguments']
-        address = int(args['memoryReference'], 16)
-        count = args.get('count', 64)
-        address += args.get('offset', 0)
-        data = self._read_memory_gdb(address, count)
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'readMemory',
-            'success': True,
-            'body': {
-                'address': f'0x{address:04x}',
-                'data': base64.b64encode(data).decode('ascii'),
-            },
+        address = int(args['memoryReference'], 16) + args.get('offset', 0)
+        data = self._read_memory_gdb(address, args.get('count', 64))
+        self.respond(msg, {
+            'address': f'0x{address:04x}',
+            'data': base64.b64encode(data).decode('ascii'),
         })
 
     def handle_step(self, msg):
         self.gdb_send('s')
-        resp = self.gdb_recv()
-        logging.debug(f'Step stop: {resp}')
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': msg['command'],
-            'success': True,
-        })
-        self.send({
-            'type': 'event',
-            'event': 'stopped',
-            'body': {'reason': 'step', 'threadId': 1, 'allThreadsStopped': True},
-        })
+        logging.debug(f'Step stop: {self.gdb_recv()}')
+        self.respond(msg)
+        self.send_stopped('step')
 
     def handle_continue(self, msg):
         pc = self.read_registers().get('PC')
@@ -371,13 +265,7 @@ class MameAdapter(DAPAdapter):
             self._step_over_breakpoint_at(pc)
         self.gdb_send('c')
         self.start_monitor('breakpoint')
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'continue',
-            'success': True,
-            'body': {'allThreadsContinued': True},
-        })
+        self.respond(msg, {'allThreadsContinued': True})
 
     def _terminate_spawned_process(self):
         if not self._process:
@@ -410,12 +298,7 @@ class MameAdapter(DAPAdapter):
             except Exception:
                 pass
         self._terminate_spawned_process()
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'disconnect',
-            'success': True,
-        })
+        self.respond(msg)
         sys.exit(0)
 
 

@@ -186,6 +186,16 @@ class and implemented per-adapter. This is why `MameAdapter` and
 `ZesaruxAdapter` share stack-trace/scopes/variables behavior byte-for-byte
 despite talking completely different wire protocols to their emulators.
 
+Two helpers keep the per-adapter code down to just what differs:
+`respond(msg, body)` fills in a DAP response's `request_seq`/`command`/
+`success` from the request being answered, and `send_stopped(reason)`
+emits the `stopped` event. Session setup is shared the same way —
+`read_symbol_args(args)` pulls the binary/symbol paths out of a launch
+request, and `load_debug_info(source_path)` resolves and parses them all
+(see 5.3), returning the binary's path. Each adapter's `_load_binary` is
+then only its own load step: `load-binary` over ZRCP for ZEsarUX, a raw
+GDB memory write for MAME.
+
 ### 5.3 Symbol/debug-info parsing
 
 This is the part of the codebase that knows about specific toolchains.
@@ -234,7 +244,7 @@ assembled directly (hand-written `.s`), see 5.3.4.
 #### 5.3.3 Load address resolution priority
 
 There are three possible sources for "where in Z80 memory does byte 0 of
-the binary go", tried in this order in `ZesaruxAdapter._load_binary`:
+the binary go", tried in this order in `DAPAdapter.load_debug_info`:
 
 1. `loadAddress` in `launch.json`, if present — always wins, never
    second-guessed.
@@ -292,7 +302,7 @@ directly:
    `.module` name, for the same aliasing reason as step 1.
 4. **`build_asm_line_map(map_path)`** combines the three into `{addr:
    (basename, line)}`, and is merged into `self.address_to_source` in
-   `ZesaruxAdapter._load_binary` — but only to fill gaps
+   `load_debug_info` — but only to fill gaps
    (`if addr not in address_to_source`), since existing `C$`/`.cdb`
    entries are never wrong and should win on overlap.
 
@@ -385,11 +395,15 @@ Runs once per session (guarded by `_setup_done`), triggered from the
 first `setBreakpoints` request (so it has a concrete source path to
 derive `build/<name>.bin` / `.sld` from, if `program`/`sldFile` weren't
 given explicitly) and again, as a no-op past the guard, from
-`configurationDone`. Order of operations: resolve paths → parse
-`.map`/`.sld` → resolve load address (5.3.3) → parse `.cdb` if present and
-merge into `sld_map`/`address_to_source` → fill remaining gaps from
-`.lst` listings via `build_asm_line_map` (5.3.4) → `load-binary` over ZRCP
-→ `enable-breakpoints`.
+`configurationDone`.
+
+The resolving and parsing is all `load_debug_info` in `base.py` (shared
+with MAME — see 5.2): resolve paths → parse `.map`/`.sld` → resolve load
+address (5.3.3) → parse `.cdb` if present and merge into
+`sld_map`/`address_to_source` → fill remaining gaps from `.lst` listings
+via `build_asm_line_map` (5.3.4). It hands back the binary's path, and
+`_load_binary` does the ZEsarUX-specific part: `load-binary` over ZRCP,
+then `enable-breakpoints`.
 
 ### 6.4 Breakpoints (`handle_set_breakpoints`)
 
@@ -542,8 +556,8 @@ immediately after a launch, before you've pressed continue.
 Write a `parse_<format>(self, path)` method on `DAPAdapter` (or, if it
 needs per-object files the way `.lst` does, a small family of methods —
 see 5.3.4) returning `(line_to_addr, addr_to_line)` in the same shapes as
-`parse_sld`/`parse_map`, and wire it into the relevant adapter's
-`_load_binary`-equivalent alongside the existing format detection. Keep
+`parse_sld`/`parse_map`, and wire it into `load_debug_info` alongside the
+existing format detection — both adapters pick it up from there. Keep
 in mind: paths recorded in third-party debug-info files are not
 guaranteed absolute (5.3.1) — resolve against a known-good anchor (the
 debug-info file's own location, or an already-registered `_source_path`)

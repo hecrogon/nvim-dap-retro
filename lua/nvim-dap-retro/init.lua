@@ -77,25 +77,29 @@ M.setup = function(opts)
       end,
     })
   end
-  vim.notify("nvim-dap-retro loaded", vim.log.levels.INFO)
 end
 
-local function find_tasks_file()
-  local primary  = vim.fn.getcwd() .. "/.debug/tasks.json"
-  local fallback = vim.fn.getcwd() .. "/.vscode/tasks.json"
-  if vim.fn.filereadable(primary) == 1 then return primary end
-  if vim.fn.filereadable(fallback) == 1 then return fallback end
+-- Project config lives in .debug/, falling back to .vscode/ so an existing
+-- VSCode-style project works without being rearranged.
+local function project_file(name)
+  for _, dir in ipairs({ ".debug", ".vscode" }) do
+    local path = vim.fn.getcwd() .. "/" .. dir .. "/" .. name
+    if vim.fn.filereadable(path) == 1 then return path end
+  end
+end
+
+local function read_json(path)
+  local readable, content = pcall(vim.fn.readfile, path)
+  if not readable then return nil end
+  local decoded, parsed = pcall(vim.fn.json_decode, table.concat(content, "\n"))
+  if not decoded then return nil end
+  return parsed
 end
 
 local function resolve_task(label)
-  local path = find_tasks_file()
-  if not path then return nil end
-
-  local ok, content = pcall(vim.fn.readfile, path)
-  if not ok then return nil end
-
-  local ok2, parsed = pcall(vim.fn.json_decode, table.concat(content, "\n"))
-  if not ok2 then return nil end
+  local path = project_file("tasks.json")
+  local parsed = path and read_json(path)
+  if not parsed then return nil end
 
   for _, task in ipairs(parsed.tasks or {}) do
     if task.label == label then
@@ -108,6 +112,9 @@ local function run_task(task, on_success)
   local build_log = require("nvim-dap-retro.build_log")
   build_log.clear()
 
+  -- With args we hand jobstart a list, which it execs directly; without them it gets a
+  -- bare string and runs it through the shell. So "make build" works as a command on its
+  -- own, but pair it with args and it'd be exec'd as one oddly-named binary.
   local args = task.args or {}
   local cmd = #args > 0 and vim.list_extend({ task.command }, args) or task.command
   vim.notify("nvim-dap-retro: running task '" .. task.label .. "'")
@@ -126,15 +133,22 @@ local function run_task(task, on_success)
 end
 
 local function read_launch_configs()
-  local path = vim.fn.getcwd() .. "/.debug/launch.json"
-  if vim.fn.filereadable(path) == 0 then return nil end
-  local ok, content = pcall(vim.fn.readfile, path)
-  if not ok then return nil end
-  local ok2, parsed = pcall(vim.fn.json_decode, table.concat(content, "\n"))
-  if not ok2 then return nil end
+  local path = project_file("launch.json")
+  local parsed = path and read_json(path)
+  if not parsed then return nil end
   local configs = parsed.configurations or {}
-  if #configs == 0 then return nil end
-  return configs
+  if #configs > 0 then return configs end
+end
+
+-- nvim-dap keys configurations by filetype, which retro extensions don't map onto
+-- cleanly (.z80/.s80/.s/.asm all being "Z80 asm"), so look through every filetype
+-- for the first config belonging to this adapter.
+local function find_registered_config(dap, adapter)
+  for _, ft_configs in pairs(dap.configurations) do
+    for _, config in ipairs(ft_configs) do
+      if config.type == adapter then return config end
+    end
+  end
 end
 
 local function start_config(dap, config)
@@ -180,17 +194,7 @@ M.debug = function()
     return
   end
 
-  local config
-  for _, ft_configs in pairs(dap.configurations) do
-    for _, c in ipairs(ft_configs) do
-      if c.type == adapter then
-        config = c
-        break
-      end
-    end
-    if config then break end
-  end
-
+  local config = find_registered_config(dap, adapter)
   if not config then
     vim.notify("nvim-dap-retro: no DAP configuration found for adapter '" .. adapter .. "'", vim.log.levels.WARN)
     return

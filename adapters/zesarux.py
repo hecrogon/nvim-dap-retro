@@ -22,18 +22,14 @@ class ZesaruxAdapter(DAPAdapter):
     def __init__(self):
         super().__init__(LOG_FILE)
         self._load_address = 0x4000
-        self._load_address_explicit = False
         self._zesarux_host = ZESARUX_DEFAULT_HOST
         self._zesarux_port = ZESARUX_DEFAULT_PORT
         self._sock = None
         self._process = None
-        self._setup_done = False
         self._machine_name = ''
         self._io_port_sections = {}  # {variablesReference: [child vars]}
         self._active_breakpoints = set()
         self._stop_on_exit = True
-        self.map_file = None
-        self.cdb_file = None
         self._zrcp_lock = threading.Lock()
         self._recv_buffer = b''
 
@@ -182,22 +178,67 @@ class ZesaruxAdapter(DAPAdapter):
                 'ZEsarUX window (or kill the process) and relaunch the debug session'
             )
 
+    # Anything that dismisses a ZEsarUX window drops it back out of cpu-step mode --
+    # pressing ESC on the emulator does exactly that, and it's easy to do because that
+    # window blocks emulation until it's cleared. Breakpoints only work inside step mode,
+    # so the moment it's lost the debuggee free-runs to completion past every breakpoint.
+    # We can get step mode back, but whatever the program already did is gone.
+    _CPU_STEP_LOST = 'must first enter cpu-step mode'
+
+    def _notify(self, text):
+        """Put a line in the DAP debug console so the user sees it."""
+        self.send({'type': 'event', 'event': 'output',
+                   'body': {'category': 'important', 'output': text + '\n'}})
+
+    def log_screen(self, when):
+        """Record anything ZEsarUX is showing over the emulated screen.
+
+        A window left up here blocks emulation until it's dismissed, and dismissing it
+        costs us step mode -- so when a session misbehaves, this says what was on screen.
+        """
+        try:
+            overlay = self.zrcp('get-text-overlay')
+        except RuntimeError:
+            return
+        lines = [l.strip() for l in overlay.splitlines()
+                 if l.strip() and not l.strip().startswith('command')]
+        if lines:
+            logging.warning(f'ZEsarUX has something on screen {when}: {lines}')
+        else:
+            logging.debug(f'ZEsarUX screen clear {when}')
+
+    def _regain_cpu_step(self, response):
+        """Step mode back on if `response` says we lost it. True if we had to."""
+        if self._CPU_STEP_LOST not in response:
+            return False
+        logging.warning('ZEsarUX left cpu-step mode behind our back -- re-entering')
+        self.log_screen('when cpu-step mode was lost')
+        self.enter_cpu_step()
+        self._notify(
+            'ZEsarUX dropped out of step mode -- this happens when its own window is '
+            'dismissed (e.g. pressing ESC on the emulator). The program kept running '
+            'past your breakpoints while it was out. Restart the debug session to get '
+            'a clean run.'
+        )
+        return True
+
     # ── Stop monitor ──────────────────────────────────────────────────────────
 
     def _monitor_breakpoint(self, reason):
         response = self._wait_for_stop()
+        try:
+            if self._regain_cpu_step(response):
+                response = self._wait_for_stop()
+        except RuntimeError as err:
+            logging.error(f'could not get back into cpu-step mode: {err}')
+
         logging.debug(f'ZEsarUX stopped ({reason}): {response}')
-        if 'must first enter cpu-step mode' in response:
-            logging.debug('run rejected -- ZEsarUX left cpu-step mode; reporting program exit')
+        if self._CPU_STEP_LOST in response:
+            logging.debug('still not in cpu-step mode; reporting program exit')
             self.send({'type': 'event', 'event': 'exited', 'body': {'exitCode': 0}})
             self.send({'type': 'event', 'event': 'terminated'})
             return
-
-        self.send({
-            'type': 'event',
-            'event': 'stopped',
-            'body': {'reason': reason, 'threadId': 1, 'allThreadsStopped': True},
-        })
+        self.send_stopped(reason)
 
     def start_monitor(self, reason='breakpoint'):
         t = threading.Thread(target=self._monitor_breakpoint, args=(reason,), daemon=True)
@@ -210,21 +251,11 @@ class ZesaruxAdapter(DAPAdapter):
         self._zesarux_host = args.get('zesaruxHost', ZESARUX_DEFAULT_HOST)
         self._zesarux_port = int(args.get('zesaruxPort', ZESARUX_DEFAULT_PORT))
         self._stop_on_exit = args.get('stopOnExit', True)
-        if 'program' in args:
-            self.bin_file = Path(args['program'])
-        if 'sldFile' in args:
-            self.sld_file = Path(args['sldFile'])
-        if 'mapFile' in args:
-            self.map_file = Path(args['mapFile'])
-            candidate = self.map_file.with_suffix('.cdb')
-            if candidate.exists():
-                self.cdb_file = candidate
-        if 'cdbFile' in args:
-            self.cdb_file = Path(args['cdbFile'])
-        if 'loadAddress' in args:
-            self._load_address = int(str(args['loadAddress']), 0)
-            self._load_address_explicit = True
-        logging.debug(f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} cdb_file={self.cdb_file} load_address=0x{self._load_address:04x}')
+        self.read_symbol_args(args)
+        logging.debug(
+            f'bin_file={self.bin_file} sld_file={self.sld_file} map_file={self.map_file} '
+            f'cdb_file={self.cdb_file} load_address=0x{self._load_address:04x}'
+        )
 
         if 'zesaruxArgs' in args:
             if 'zesaruxPort' in args:
@@ -249,6 +280,7 @@ class ZesaruxAdapter(DAPAdapter):
         self.close_all_menus()
         self.zrcp('hard-reset-cpu')
         self.enter_cpu_step()
+        self.log_screen('after entering cpu-step mode')
         self.zrcp('set-debug-settings 0')
         self.zrcp('clear-membreakpoints')
 
@@ -257,68 +289,17 @@ class ZesaruxAdapter(DAPAdapter):
             logging.debug('ZRCP >>> disable-breakpoint 1..100 (bulk)')
             self._sock.sendall(bulk.encode('ascii'))
             self._read_response()
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'launch',
-            'success': True,
-        })
+        self.respond(msg)
 
     def _load_binary(self, source_path=None):
+        # Runs once per session, from whichever of setBreakpoints/configurationDone
+        # arrives first.
         if self._setup_done:
             return
-        has_debug = self.sld_file is not None or self.map_file is not None
-        if self.bin_file is None or not has_debug:
-            if source_path is None:
-                logging.error('No source path available to resolve bin/sld files')
-                return
-            sp = Path(source_path)
-            project_root = sp.parent.parent
-            name = sp.stem
-            resolved_bin = self.bin_file or project_root / 'build' / f'{name}.bin'
-            resolved_sld = self.sld_file or project_root / 'build' / f'{name}.sld'
-            resolved_map = self.map_file
-        else:
-            resolved_bin = self.bin_file
-            resolved_sld = self.sld_file
-            resolved_map = self.map_file
-
-        if resolved_map is not None:
-            self.sld_map, self.address_to_source, map_load_address = self.parse_map(resolved_map)
-        elif resolved_sld is not None:
-            self.sld_map, self.address_to_source = self.parse_sld(resolved_sld)
-            map_load_address = None
-        else:
-            map_load_address = None
-
-        if not self._load_address_explicit:
-            # .ihx (if present) is authoritative -- it's what hex2bin itself
-            # uses, so it's correct even when the lowest area in the image is
-            # an (ABS) area sdld reports as address 0 everywhere in the .map.
-            ihx_load_address = self.parse_ihx_load_address(resolved_bin.with_suffix('.ihx'))
-            if ihx_load_address is not None:
-                self._load_address = ihx_load_address
-                logging.debug(f'Load address from .ihx: 0x{self._load_address:04x}')
-            elif map_load_address is not None:
-                self._load_address = map_load_address
-                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
-
-        if self.cdb_file is not None:
-            cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
-            self.sld_map.update(cdb_lines)
-            self.address_to_source.update(cdb_addrs)
-            logging.debug(f'CDB: {len(self.functions)} functions, {sum(len(v) for v in self.local_vars.values())} locals')
-
-        if resolved_map is not None:
-            asm_lines = self.build_asm_line_map(resolved_map)
-            added = 0
-            for addr, entry in asm_lines.items():
-                if addr not in self.address_to_source:
-                    self.address_to_source[addr] = entry
-                    added += 1
-            logging.debug(f'LST: filled {added} addr->line gaps from module listings')
-
-        self.zrcp(f'load-binary {resolved_bin} {self._load_address:x}h 0')
+        binary = self.load_debug_info(source_path)
+        if binary is None:
+            return
+        self.zrcp(f'load-binary {binary} {self._load_address:x}h 0')
         self.zrcp('enable-breakpoints')
         self._setup_done = True
 
@@ -348,13 +329,7 @@ class ZesaruxAdapter(DAPAdapter):
             self.zrcp(f'disable-breakpoint {i}')
         self._active_breakpoints = new_indices
 
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'setBreakpoints',
-            'success': True,
-            'body': {'breakpoints': breakpoints},
-        })
+        self.respond(msg, {'breakpoints': breakpoints})
 
     def handle_configuration_done(self, msg):
         self._load_binary(getattr(self, '_source_path', None))
@@ -362,56 +337,29 @@ class ZesaruxAdapter(DAPAdapter):
         self.zrcp(f'set-register PC={entry:x}h')
         # See _monitor_breakpoint: no close_all_menus() here -- it drops
         # cpu-step mode as a side effect and can permanently wedge ZEsarUX.
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'configurationDone',
-            'success': True,
-        })
-        self.send({
-            'type': 'event',
-            'event': 'stopped',
-            'body': {'reason': 'entry', 'threadId': 1, 'allThreadsStopped': True},
-        })
+        self.log_screen('at the entry stop, before the user continues')
+        self.respond(msg)
+        self.send_stopped('entry')
 
     def handle_read_memory(self, msg):
         args = msg['arguments']
-        address = int(args['memoryReference'], 16)
-        count = args.get('count', 64)
-        address += args.get('offset', 0)
-
-        parts = self.zrcp(f'read-memory {address:x}h {count}').split()
-        if not parts:
-            self.send({'type': 'response', 'request_seq': msg['seq'], 'command': 'readMemory', 'success': False})
+        address = int(args['memoryReference'], 16) + args.get('offset', 0)
+        data = self.read_memory_bytes(address, args.get('count', 64))
+        if data is None:
+            self.respond(msg, success=False)
             return
-        hex_string = parts[0]
-        data = bytes(int(hex_string[i:i+2], 16) for i in range(0, len(hex_string), 2))
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'readMemory',
-            'success': True,
-            'body': {
-                'address': f'0x{address:04x}',
-                'data': base64.b64encode(data).decode('ascii'),
-            },
+        self.respond(msg, {
+            'address': f'0x{address:04x}',
+            'data': base64.b64encode(data).decode('ascii'),
         })
 
     def handle_write_memory(self, msg):
         args = msg['arguments']
-        address = int(args['memoryReference'], 16)
-        address += args.get('offset', 0)
+        address = int(args['memoryReference'], 16) + args.get('offset', 0)
         data = base64.b64decode(args['data'])
-        hex_data = data.hex().upper()
 
-        self.zrcp(f'write-memory-raw {address:x}h {hex_data}')
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'writeMemory',
-            'success': True,
-            'body': {'bytesWritten': len(data)},
-        })
+        self.zrcp(f'write-memory-raw {address:x}h {data.hex().upper()}')
+        self.respond(msg, {'bytesWritten': len(data)})
 
     # ── Evaluate (debug console) ─────────────────────────────────────────────
 
@@ -430,13 +378,7 @@ class ZesaruxAdapter(DAPAdapter):
             result = (f'Unknown expression: {expr!r} -- try "tstates", '
                        f'"tstates reset", or "zrcp <command>"')
 
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'evaluate',
-            'success': True,
-            'body': {'result': result, 'variablesReference': 0},
-        })
+        self.respond(msg, {'result': result, 'variablesReference': 0})
 
     @staticmethod
     def _format_tstates(response):
@@ -529,29 +471,19 @@ class ZesaruxAdapter(DAPAdapter):
         return top_level, sections
 
     def handle_step(self, msg):
-        self.zrcp('cpu-step')
+        response = self.zrcp('cpu-step')
+        try:
+            if self._regain_cpu_step(response):
+                self.zrcp('cpu-step')
+        except RuntimeError as err:
+            logging.error(f'could not get back into cpu-step mode: {err}')
         # See _monitor_breakpoint -- no close_all_menus() here.
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': msg['command'],
-            'success': True,
-        })
-        self.send({
-            'type': 'event',
-            'event': 'stopped',
-            'body': {'reason': 'step', 'threadId': 1, 'allThreadsStopped': True},
-        })
+        self.respond(msg)
+        self.send_stopped('step')
 
     def handle_continue(self, msg):
         self.start_monitor('breakpoint')
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'continue',
-            'success': True,
-            'body': {'allThreadsContinued': True},
-        })
+        self.respond(msg, {'allThreadsContinued': True})
 
     def _terminate_spawned_process(self):
         # Shared by handle_disconnect and cleanup_on_crash (base.py) so a crash can't
@@ -572,12 +504,7 @@ class ZesaruxAdapter(DAPAdapter):
             self.zrcp('exit-cpu-step')
             self._sock.close()
         self._terminate_spawned_process()
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'disconnect',
-            'success': True,
-        })
+        self.respond(msg)
         sys.exit(0)
 
 

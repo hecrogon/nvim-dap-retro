@@ -7,6 +7,12 @@ from pathlib import Path
 
 
 class DAPAdapter:
+    # variablesReference values for the built-in scopes. Adapters add their own
+    # above these via extra_scopes().
+    SCOPE_REGISTERS = 1
+    SCOPE_LOCALS    = 2
+    SCOPE_GLOBALS   = 3
+
     def __init__(self, log_file=None):
         if log_file:
             logging.basicConfig(
@@ -23,8 +29,12 @@ class DAPAdapter:
         self._module_source_cache = {}  # {obj_path: full_path or None}
         self._project_stem_index = None # built on first use: {file_stem: full_path}
         self._load_address = 0
+        self._load_address_explicit = False
+        self._setup_done = False
         self.bin_file = None
         self.sld_file = None
+        self.map_file = None
+        self.cdb_file = None
         self.functions = []     # [(name, start_addr, end_addr)]
         self.local_vars = {}    # {funcname: [{name, storage, register|sp_offset}]}
         self.globals = []       # [{name, address, equ}] top-level SLD labels, see parse_sld
@@ -59,6 +69,27 @@ class DAPAdapter:
             logging.debug(f'<<< {body}')
             sys.stdout.write(f'Content-Length: {len(body)}\r\n\r\n{body}')
             sys.stdout.flush()
+
+    def respond(self, msg, body=None, success=True, message=None):
+        """Reply to a DAP request. Mirrors back its seq and command so callers don't have to."""
+        response = {
+            'type': 'response',
+            'request_seq': msg['seq'],
+            'command': msg['command'],
+            'success': success,
+        }
+        if body is not None:
+            response['body'] = body
+        if message is not None:
+            response['message'] = message
+        self.send(response)
+
+    def send_stopped(self, reason):
+        self.send({
+            'type': 'event',
+            'event': 'stopped',
+            'body': {'reason': reason, 'threadId': 1, 'allThreadsStopped': True},
+        })
 
     def read_message(self):
         headers = {}
@@ -391,32 +422,30 @@ class DAPAdapter:
         except (ValueError, IndexError):
             pass
 
-    @staticmethod
-    def _cdb_parse_local(raw, local_vars):
-        """S:Lmain.main$result$1_0$80({1}SC:U),R,0,0,[l]
-           S:Lmain.sumUpTo$n$1_0$82({1}SC:U),B,1,4"""
+    # S:L<module>.<func>$<var>$<level>_<block>$<col>(<type>),<storage>,...
+    #   S:Lmain.main$result$1_0$80({1}SC:U),R,0,0,[l]   -- held in register l
+    #   S:Lmain.sumUpTo$n$1_0$82({1}SC:U),B,1,4         -- held at SP+4
+    _CDB_LOCAL_RE = re.compile(r'^S:L[^.]*\.([^$]+)\$([^$]+)\$.*\)(.*)$')
+
+    @classmethod
+    def _cdb_parse_local(cls, raw, local_vars):
+        match = cls._CDB_LOCAL_RE.match(raw)
+        if not match:
+            return
+        funcname, varname, trailing = match.groups()
+        fields = trailing.lstrip(',').split(',')
+
+        var = {'name': varname, 'storage': fields[0]}
         try:
-            rest      = raw[3:]                                   # main.main$result...
-            after_dot = rest[rest.index('.') + 1:]               # main$result...
-            funcname  = after_dot[:after_dot.index('$')]          # main
-            after_func = after_dot[after_dot.index('$') + 1:]    # result$1_0$80...
-            varname   = after_func[:after_func.index('$')]        # result
-
-            paren_end  = rest.rindex(')')
-            fields     = rest[paren_end + 1:].lstrip(',').split(',')
-            storage    = fields[0] if fields else ''
-
-            var_info = {'name': varname, 'storage': storage}
-            if storage == 'R' and len(fields) >= 4:
+            if var['storage'] == 'R' and len(fields) >= 4:
                 reg = fields[3].strip()
                 if reg.startswith('[') and reg.endswith(']'):
-                    var_info['register'] = reg[1:-1]
-            elif storage == 'B' and len(fields) >= 3:
-                var_info['sp_offset'] = int(fields[2])
-
-            local_vars.setdefault(funcname, []).append(var_info)
-        except (ValueError, IndexError):
-            pass
+                    var['register'] = reg[1:-1]
+            elif var['storage'] == 'B' and len(fields) >= 3:
+                var['sp_offset'] = int(fields[2])
+        except ValueError:
+            return
+        local_vars.setdefault(funcname, []).append(var)
 
     def parse_cdb(self, cdb_path):
         """Parse SDCC .cdb file → (line_to_addr, addr_to_line, functions, local_vars).
@@ -447,6 +476,87 @@ class DAPAdapter:
             key=lambda x: x[1],
         )
         return line_to_addr, addr_to_line, functions, local_vars
+
+    # ── Session setup ────────────────────────────────────────────────────────
+
+    def read_symbol_args(self, args):
+        """Pick the binary and symbol-file paths out of a DAP launch request.
+
+        A .cdb sitting next to the .map under the same name is picked up on its own,
+        since that's how SDCC emits it.
+        """
+        if 'program' in args:
+            self.bin_file = Path(args['program'])
+        if 'sldFile' in args:
+            self.sld_file = Path(args['sldFile'])
+        if 'mapFile' in args:
+            self.map_file = Path(args['mapFile'])
+            sibling_cdb = self.map_file.with_suffix('.cdb')
+            if sibling_cdb.exists():
+                self.cdb_file = sibling_cdb
+        if 'cdbFile' in args:
+            self.cdb_file = Path(args['cdbFile'])
+        if 'loadAddress' in args:
+            self._load_address = int(str(args['loadAddress']), 0)
+            self._load_address_explicit = True
+
+    def load_debug_info(self, source_path=None):
+        """Work out which binary and symbol files this session uses, and parse them.
+
+        Fills in sld_map, address_to_source, functions, local_vars and _load_address.
+        Returns the binary's path, or None if we couldn't work out what to load.
+        Actually getting the binary into the machine is the adapter's job -- every
+        emulator has its own way of doing it.
+        """
+        if self.bin_file is not None and (self.sld_file or self.map_file):
+            binary, sld = self.bin_file, self.sld_file
+        elif source_path is None:
+            logging.error('No source path available to resolve bin/sld files')
+            return None
+        else:
+            # Fall back to the build/<name>.{bin,sld} convention next to the source.
+            source = Path(source_path)
+            build = source.parent.parent / 'build'
+            binary = self.bin_file or build / f'{source.stem}.bin'
+            sld = self.sld_file or build / f'{source.stem}.sld'
+
+        map_load_address = None
+        if self.map_file is not None:
+            self.sld_map, self.address_to_source, map_load_address = self.parse_map(self.map_file)
+        elif sld is not None:
+            self.sld_map, self.address_to_source = self.parse_sld(sld)
+
+        if not self._load_address_explicit:
+            # The .ihx wins when it's there -- it's what hex2bin itself goes by, so it
+            # stays right even when the lowest area is one sdld reports as address 0.
+            ihx_address = self.parse_ihx_load_address(binary.with_suffix('.ihx'))
+            if ihx_address is not None:
+                self._load_address = ihx_address
+                logging.debug(f'Load address from .ihx: 0x{self._load_address:04x}')
+            elif map_load_address is not None:
+                self._load_address = map_load_address
+                logging.debug(f'Load address from map file s__CODE: 0x{self._load_address:04x}')
+
+        if self.cdb_file is not None:
+            cdb_lines, cdb_addrs, self.functions, self.local_vars = self.parse_cdb(self.cdb_file)
+            self.sld_map.update(cdb_lines)
+            self.address_to_source.update(cdb_addrs)
+            logging.debug(
+                f'CDB: {len(self.functions)} functions, '
+                f'{sum(len(v) for v in self.local_vars.values())} locals'
+            )
+
+        if self.map_file is not None:
+            # Hand-written .s modules get no C$ records, so fill their gaps from .lst listings.
+            gaps = {
+                addr: entry
+                for addr, entry in self.build_asm_line_map(self.map_file).items()
+                if addr not in self.address_to_source
+            }
+            self.address_to_source.update(gaps)
+            logging.debug(f'LST: filled {len(gaps)} addr->line gaps from module listings')
+
+        return binary
 
     # ── Register helpers ─────────────────────────────────────────────────────
 
@@ -554,44 +664,26 @@ class DAPAdapter:
     # ── Common DAP handlers ───────────────────────────────────────────────────
 
     def handle_initialize(self, msg):
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'initialize',
-            'success': True,
-            'body': {
-                'supportsConfigurationDoneRequest': True,
-                'supportsReadMemoryRequest': True,
-                'supportsWriteMemoryRequest': True,
-                'supportsSetVariable': True,
-            },
+        self.respond(msg, {
+            'supportsConfigurationDoneRequest': True,
+            'supportsReadMemoryRequest': True,
+            'supportsWriteMemoryRequest': True,
+            'supportsSetVariable': True,
         })
         self.send({'type': 'event', 'event': 'initialized'})
 
     def handle_threads(self, msg):
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'threads',
-            'success': True,
-            'body': {'threads': [{'id': 1, 'name': 'Z80'}]},
-        })
+        self.respond(msg, {'threads': [{'id': 1, 'name': 'Z80'}]})
 
     def handle_scopes(self, msg):
         scopes = []
         if self.local_vars:
-            scopes.append({'name': 'Locals', 'variablesReference': 2, 'expensive': False})
-        scopes.append({'name': 'Registers', 'variablesReference': 1, 'expensive': False})
+            scopes.append({'name': 'Locals', 'variablesReference': self.SCOPE_LOCALS, 'expensive': False})
+        scopes.append({'name': 'Registers', 'variablesReference': self.SCOPE_REGISTERS, 'expensive': False})
         if self.globals:
-            scopes.append({'name': 'Globals', 'variablesReference': 3, 'expensive': False})
+            scopes.append({'name': 'Globals', 'variablesReference': self.SCOPE_GLOBALS, 'expensive': False})
         scopes.extend(self.extra_scopes())
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'scopes',
-            'success': True,
-            'body': {'scopes': scopes},
-        })
+        self.respond(msg, {'scopes': scopes})
 
     def handle_stack_trace(self, msg):
         regs = self.read_registers()
@@ -607,45 +699,33 @@ class DAPAdapter:
         else:
             line        = 1
             source_path = self._source_path
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'stackTrace',
-            'success': True,
-            'body': {
-                'stackFrames': [{
-                    'id': 1,
-                    'name': self._func_name_at(pc) or f'PC={pc:#06x}',
-                    'source': {'path': source_path},
-                    'line': line,
-                    'column': 1,
-                }],
-                'totalFrames': 1,
-            },
+        self.respond(msg, {
+            'stackFrames': [{
+                'id': 1,
+                'name': self._func_name_at(pc) or f'PC={pc:#06x}',
+                'source': {'path': source_path},
+                'line': line,
+                'column': 1,
+            }],
+            'totalFrames': 1,
         })
 
     def handle_variables(self, msg):
         ref = msg['arguments'].get('variablesReference')
         regs = self.read_registers()
-        if ref == 1:
+        if ref == self.SCOPE_REGISTERS:
             variables = [
                 {'name': n, 'value': f'0x{v:04x}', 'type': 'register', 'variablesReference': 0}
                 for n, v in regs.items()
             ]
-        elif ref == 2:
+        elif ref == self.SCOPE_LOCALS:
             pc = regs.get('PC', self._load_address)
             variables = self._locals_for_pc(pc, regs)
-        elif ref == 3:
+        elif ref == self.SCOPE_GLOBALS:
             variables = self._global_variables()
         else:
             variables = self.extra_scope_variables(ref)
-        self.send({
-            'type': 'response',
-            'request_seq': msg['seq'],
-            'command': 'variables',
-            'success': True,
-            'body': {'variables': variables},
-        })
+        self.respond(msg, {'variables': variables})
 
     @staticmethod
     def _hex_candidate(segment):
@@ -686,7 +766,7 @@ class DAPAdapter:
         return candidates[-1][1]
 
     def handle_set_variable(self, msg):
-        """Only the Registers scope (ref 1) is editable -- Locals/Globals/etc. are derived
+        """Only the Registers scope is editable -- Locals/Globals/etc. are derived
         read-only views with no single emulator write that would make sense to target.
         """
         args      = msg['arguments']
@@ -694,32 +774,19 @@ class DAPAdapter:
         name      = args.get('name')
         raw_value = args.get('value', '').strip()
 
-        if ref != 1:
-            self.send({
-                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
-                'success': False, 'message': 'Only the Registers scope supports editing',
-            })
+        if ref != self.SCOPE_REGISTERS:
+            self.respond(msg, success=False, message='Only the Registers scope supports editing')
             return
 
         value = self._parse_register_edit(raw_value, name)
         if value is None:
-            self.send({
-                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
-                'success': False, 'message': f'Invalid hex value: {raw_value!r}',
-            })
+            self.respond(msg, success=False, message=f'Invalid hex value: {raw_value!r}')
             return
 
         if self.write_register(name, value):
-            self.send({
-                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
-                'success': True,
-                'body': {'value': f'0x{value:04x}', 'variablesReference': 0},
-            })
+            self.respond(msg, {'value': f'0x{value:04x}', 'variablesReference': 0})
         else:
-            self.send({
-                'type': 'response', 'request_seq': msg['seq'], 'command': 'setVariable',
-                'success': False, 'message': f'Emulator rejected writing register {name!r}',
-            })
+            self.respond(msg, success=False, message=f'Emulator rejected writing register {name!r}')
 
     # ── Abstract interface ────────────────────────────────────────────────────
 

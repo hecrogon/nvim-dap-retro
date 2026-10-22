@@ -5,7 +5,6 @@
       "request": "launch",
       "name": "ZEsarUX Debug",
       "zesaruxPath": "zesarux",
-      "zesaruxPort": 10000,
       "zesaruxArgs": ["--machine", "48k", "--disable-autoframeskip"],
       "program": "${workspaceFolder}/build/hello.bin",
       "sldFile": "${workspaceFolder}/build/hello.sld",

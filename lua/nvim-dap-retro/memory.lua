@@ -90,6 +90,15 @@ local function byte_addr_at_cursor()
   return addr, flat_idx
 end
 
+-- Accepts "C000" or "0xC000" — the same spellings the dump itself uses.
+local function parse_hex(input)
+  local trimmed = vim.trim(input)
+  if trimmed:sub(1, 2):lower() == "0x" then
+    trimmed = trimmed:sub(3)
+  end
+  return tonumber(trimmed, 16)
+end
+
 local function edit_byte()
   local addr, flat_idx = byte_addr_at_cursor()
   if not addr then return end
@@ -101,11 +110,7 @@ local function edit_byte()
     or  string.format("Value at %04X (hex): ", addr)
   vim.ui.input({ prompt = prompt }, function(input)
     if not input or input == "" then return end
-    local trimmed = vim.trim(input)
-    if trimmed:sub(1, 2):lower() == "0x" then
-      trimmed = trimmed:sub(3)
-    end
-    local value = tonumber(trimmed, 16)
+    local value = parse_hex(input)
     if not value or value < 0 or value > 255 then
       vim.notify("Invalid byte value (expected 00-FF)", vim.log.levels.ERROR)
       return
@@ -187,15 +192,10 @@ local function scroll(bytes)
   refresh()
 end
 
--- Accepts an address with or without a leading "0x", same as edit_byte does for byte values.
 local function jump_to_address()
   vim.ui.input({ prompt = "Jump to address (hex): " }, function(input)
     if not input or input == "" then return end
-    local trimmed = vim.trim(input)
-    if trimmed:sub(1, 2):lower() == "0x" then
-      trimmed = trimmed:sub(3)
-    end
-    local addr = tonumber(trimmed, 16)
+    local addr = parse_hex(input)
     if not addr or addr < 0 or addr > 0xFFFF then
       vim.notify("Invalid address (expected 16-bit hex, e.g. C000 or 0xC000)", vim.log.levels.ERROR)
       return
